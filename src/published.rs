@@ -19,6 +19,7 @@ pub struct Publication {
 
 pub(crate) struct Location {
     pub(crate) root: PathBuf,
+    pub(crate) directory: PathBuf,
     projection_file: PathBuf,
     projection: BTreeMap<String, Blob>,
 }
@@ -38,26 +39,57 @@ impl Location {
             !root.starts_with(&state) && !state.starts_with(&root),
             "publication root and Nice Sync state overlap"
         );
-        let directory = state.join("shares").join(name);
-        let root_id = blake3::hash(root.as_os_str().as_encoded_bytes());
+        let base = state.join("shares").join(name);
+        let root_id = blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex();
+        let directory = archive_directory(&base, root_id.as_str())?;
         let projection_file = directory.join(format!("projection-{root_id}.json"));
         let projection = read_json(&projection_file)?;
         Ok(Self {
             root,
+            directory,
             projection_file,
             projection,
         })
     }
 }
 
+fn archive_directory(base: &Path, root_id: &str) -> Result<PathBuf> {
+    fs::create_dir_all(base)?;
+    let binding = base.join("primary-root.json");
+    let mut primary: Option<String> = read_json(&binding)?;
+    if primary.is_none() {
+        let mut legacy_roots = Vec::new();
+        for entry in fs::read_dir(base)? {
+            let entry = entry?;
+            let file = entry.file_name();
+            if let Some(id) = file
+                .to_str()
+                .and_then(|file| file.strip_prefix("projection-"))
+                .and_then(|file| file.strip_suffix(".json"))
+                && id.len() == 64
+            {
+                legacy_roots.push(id.to_owned());
+            }
+        }
+        primary = match legacy_roots.as_slice() {
+            [id] => Some(id.clone()),
+            [] if !base.join("catalog.json").exists() => Some(root_id.to_owned()),
+            _ => None,
+        };
+        if let Some(id) = &primary {
+            write_json(&binding, id)?;
+        }
+    }
+    if primary.as_deref() == Some(root_id) {
+        Ok(base.to_owned())
+    } else {
+        Ok(base.join("roots").join(root_id))
+    }
+}
+
 impl Publication {
     pub(crate) fn open(location: Location) -> Result<Self> {
-        let store = Store::open(
-            location
-                .projection_file
-                .parent()
-                .context("missing store directory")?,
-        )?;
+        let store = Store::open(&location.directory)?;
         Ok(Self { store, location })
     }
 

@@ -154,12 +154,40 @@ fn join_uses_host_policy_and_follows_updates() -> Result<()> {
     fs::write(&fixture.config, &updated)?;
     fixture.write("server-files/docs/skip.txt", "excluded by the new policy")?;
     fixture.write("server-files/docs/notes.txt", "updated")?;
+    wait_for_config(&fixture, &mut host, &updated)?;
+    fixture.run("laptop", &["sync", "--follow-config"])?;
+    fixture.assert_contents("state-laptop/shared.sync", &updated)?;
+    fixture.assert_contents("laptop-files/docs/notes.txt", "updated")?;
+    assert!(!fixture.path("laptop-files/docs/skip.txt").exists());
+
+    let moved = updated
+        .replace("\"server-files/docs\"", "\"server-files/Учеба\"")
+        .replace("\"laptop-files/docs\"", "\"laptop-files/Учеба\"");
+    fixture.write("server-files/Учеба/lesson.txt", "new publication root")?;
+    fs::create_dir_all(fixture.path("laptop-files/Учеба"))?;
+    fs::write(&fixture.config, &moved)?;
+    wait_for_config(&fixture, &mut host, &moved)?;
+    fixture.run("laptop", &["sync", "--follow-config"])?;
+    fixture.assert_contents("laptop-files/Учеба/lesson.txt", "new publication root")?;
+    assert!(!fixture.path("server-files/Учеба/notes.txt").exists());
+    assert!(!fixture.path("laptop-files/Учеба/notes.txt").exists());
+    fixture.assert_contents("server-files/docs/notes.txt", "updated")?;
+
+    fs::write(&fixture.config, &updated)?;
+    wait_for_config(&fixture, &mut host, &updated)?;
+    fixture.run("laptop", &["sync", "--follow-config"])?;
+    fixture.assert_contents("laptop-files/docs/notes.txt", "updated")?;
+    assert!(!fixture.path("server-files/docs/lesson.txt").exists());
+    Ok(())
+}
+
+fn wait_for_config(fixture: &Fixture, host: &mut Host, source: &str) -> Result<()> {
     let active = fixture.path("state-server/applied.json");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let applied: Applied = nice_sync::store::read_json(&active)?;
-        if applied.source == updated {
-            break;
+        if applied.source == source {
+            return Ok(());
         }
         ensure!(host.0.try_wait()?.is_none(), "host exited during reload");
         ensure!(
@@ -168,10 +196,25 @@ fn join_uses_host_policy_and_follows_updates() -> Result<()> {
         );
         thread::sleep(Duration::from_millis(50));
     }
-    fixture.run("laptop", &["sync", "--follow-config"])?;
-    fixture.assert_contents("state-laptop/shared.sync", &updated)?;
-    fixture.assert_contents("laptop-files/docs/notes.txt", "updated")?;
-    assert!(!fixture.path("laptop-files/docs/skip.txt").exists());
+}
+
+#[test]
+fn changing_root_at_start_keeps_the_legacy_archive_separate() -> Result<()> {
+    let fixture = Fixture::new(SAMPLE)?;
+    fixture.write("server-files/docs/old.txt", "legacy archive")?;
+    drop(fixture.host()?);
+    fs::remove_file(fixture.path("state-server/listener.json"))?;
+    fs::remove_file(fixture.path("state-server/shares/docs/primary-root.json"))?;
+
+    let moved = SAMPLE.replace("\"server-files/docs\"", "\"server-files/Учеба\"");
+    fs::write(&fixture.config, &moved)?;
+    fixture.write("server-files/Учеба/lesson.txt", "new archive")?;
+    let _host = fixture.host()?;
+    assert!(!fixture.path("server-files/Учеба/old.txt").exists());
+    fixture.assert_contents("server-files/docs/old.txt", "legacy archive")?;
+    let legacy = fs::read_to_string(fixture.path("state-server/shares/docs/catalog.json"))?;
+    assert!(legacy.contains("old.txt"));
+    assert!(!legacy.contains("lesson.txt"));
     Ok(())
 }
 

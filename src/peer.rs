@@ -123,6 +123,7 @@ pub struct Server {
     share_config: bool,
     state: PathBuf,
     applied: Applied,
+    config_hash: blake3::Hash,
     network: Network,
     destination: Destination,
     publications: BTreeMap<String, Publication>,
@@ -182,6 +183,7 @@ impl Server {
             Self {
                 share_config,
                 state: state.to_owned(),
+                config_hash: blake3::hash(applied.source.as_bytes()),
                 applied,
                 network,
                 destination,
@@ -209,26 +211,20 @@ impl Server {
         );
 
         let mut added = BTreeMap::new();
-        let mut moved = BTreeMap::new();
         for (name, location) in publication_locations(&self.state, &candidate, &network)? {
-            if let Some(existing) = self.publications.get(&name) {
-                if existing.location.root != location.root {
-                    moved.insert(name, location);
-                }
-            } else {
+            if self
+                .publications
+                .get(&name)
+                .is_none_or(|existing| existing.location.root != location.root)
+            {
                 added.insert(name, Publication::open(location)?);
             }
         }
         candidate.save(&self.state)?;
         self.publications
             .retain(|name, _| network.shares.contains_key(name));
-        for (name, location) in moved {
-            self.publications
-                .get_mut(&name)
-                .expect("previously opened publication")
-                .location = location;
-        }
         self.publications.extend(added);
+        self.config_hash = blake3::hash(candidate.source.as_bytes());
         self.applied = candidate;
         self.network = network;
         Ok(true)
@@ -239,9 +235,25 @@ impl Server {
         peer: EndpointId,
         request: Request,
         data: Vec<u8>,
+        sync_config: &mut Option<blake3::Hash>,
     ) -> Result<(Answer, Vec<u8>)> {
         if !matches!(request, Request::Chunk { .. }) {
             ensure!(data.is_empty(), "unexpected request body");
+        }
+        if let Some(hash) = sync_config
+            && matches!(
+                request,
+                Request::Manifest { .. }
+                    | Request::Prepare { .. }
+                    | Request::Chunk { .. }
+                    | Request::Commit { .. }
+                    | Request::Read { sync: true, .. }
+            )
+        {
+            ensure!(
+                *hash == self.config_hash,
+                "configuration changed during synchronization; retry sync"
+            );
         }
         if let Request::Enroll { token, device } = request {
             ensure!(
@@ -264,6 +276,7 @@ impl Server {
                     self.share_config,
                     "host has not enabled shared configuration"
                 );
+                *sync_config = Some(self.config_hash);
                 (Answer::SharedConfig(self.applied.source.clone()), empty)
             }
             Request::Enroll { .. } => unreachable!(),
@@ -506,9 +519,11 @@ impl Server {
     fn partial(&self, peer: EndpointId, share: &str, blob: &Blob) -> Result<PartialFile> {
         PartialFile::new(
             &self
-                .state
-                .join("shares")
-                .join(share)
+                .publications
+                .get(share)
+                .context("unknown publication")?
+                .location
+                .directory
                 .join("incoming")
                 .join(peer.to_string()),
             blob,
@@ -623,6 +638,7 @@ async fn watch_config(server: Arc<Mutex<Server>>, source: PathBuf) {
 
 async fn handle_connection(connection: Connection, server: Arc<Mutex<Server>>) -> Result<()> {
     let peer = connection.remote_id();
+    let mut sync_config = None;
     loop {
         let Ok(Ok((mut send, mut receive))) =
             tokio::time::timeout(wire::TIMEOUT, connection.accept_bi()).await
@@ -634,13 +650,18 @@ async fn handle_connection(connection: Connection, server: Arc<Mutex<Server>>) -
         let result = match invocation {
             Ok(Ok((request, data))) => {
                 let server = Arc::clone(&server);
-                tokio::task::spawn_blocking(move || {
-                    server
+                let (result, current_config) = tokio::task::spawn_blocking(move || {
+                    let result = server
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("server state unavailable"))?
-                        .handle(peer, request, data)
+                        .map_err(|_| anyhow::anyhow!("server state unavailable"))
+                        .and_then(|mut server| {
+                            server.handle(peer, request, data, &mut sync_config)
+                        });
+                    (result, sync_config)
                 })
-                .await?
+                .await?;
+                sync_config = current_config;
+                result
             }
             Ok(Err(error)) => Err(error),
             Err(error) => Err(error.into()),
