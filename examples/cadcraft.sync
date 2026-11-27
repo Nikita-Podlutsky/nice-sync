@@ -1,0 +1,18 @@
+network home {
+    device windows
+    device linux
+
+    share learn {
+        host windows at "C:/Users/pniki/Downloads/cadcraft"
+        mirror linux at "/home/nikita/Downloads/cadcraft" on delete keep on conflict keep-both
+        ignore directory "**/target"
+        ignore directory "**/.git"
+    }
+
+    invitation connect-linux {
+        issued by windows
+        grant browse, download, mirror on learn
+        expires in 15m
+        uses 1
+    }
+}

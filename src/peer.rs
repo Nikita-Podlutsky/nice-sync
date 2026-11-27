@@ -1,0 +1,552 @@
+use crate::{
+    access::{self, Destination, Device},
+    language::{Applied, Mode, Network, Right, Rule, Share},
+    published::{Edit, Heads, Publication},
+    store::{Blob, Version, lock_directory, validate_path, write_json},
+    transfer::{PartialFile, read_chunk},
+    wire,
+};
+use anyhow::{Context, Result, ensure};
+use iroh::{Endpoint, EndpointId, endpoint::Connection};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+#[derive(Deserialize, Serialize)]
+pub enum Request {
+    SharedConfig,
+    Enroll {
+        token: [u8; 32],
+        device: String,
+    },
+    Issue {
+        template: String,
+        device: String,
+    },
+    Roots,
+    List {
+        share: String,
+        directory: String,
+    },
+    History {
+        share: String,
+        path: String,
+    },
+    Read {
+        share: String,
+        path: String,
+        version: Option<u64>,
+        offset: u64,
+        sync: bool,
+    },
+    Manifest {
+        share: String,
+    },
+    Prepare {
+        share: String,
+        path: String,
+        blob: Blob,
+    },
+    Chunk {
+        share: String,
+        path: String,
+        blob: Blob,
+        offset: u64,
+    },
+    Commit {
+        share: String,
+        path: String,
+        blob: Option<Blob>,
+        base: Option<u64>,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+pub enum Answer {
+    SharedConfig(String),
+    Enrolled(String),
+    Code(String),
+    Names(Vec<String>),
+    History(Vec<Version>),
+    File(Version),
+    Manifest(Heads),
+    Offset(u64),
+    Committed(String),
+}
+
+pub struct Client {
+    endpoint: Endpoint,
+    connection: Connection,
+}
+
+impl Client {
+    pub async fn connect(state: &Path, destination: &Destination) -> Result<Self> {
+        let direct = if destination.direct {
+            let target = destination
+                .endpoint
+                .ip_addrs()
+                .next()
+                .context("direct connection has no address")?;
+            let ip = if target.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            };
+            Some(SocketAddr::new(ip, 0))
+        } else {
+            None
+        };
+        let endpoint = wire::bind(access::key(state)?, direct).await?;
+        let connection = wire::connect(&endpoint, destination.endpoint.clone()).await?;
+        Ok(Self {
+            endpoint,
+            connection,
+        })
+    }
+
+    pub async fn call(&self, request: Request, data: &[u8]) -> Result<(Answer, Vec<u8>)> {
+        wire::call(&self.connection, &request, data).await
+    }
+
+    pub async fn close(self) {
+        self.endpoint.close().await;
+    }
+}
+
+pub struct Server {
+    share_config: bool,
+    state: PathBuf,
+    applied: Applied,
+    network: Network,
+    destination: Destination,
+    publications: BTreeMap<String, Publication>,
+}
+
+impl Server {
+    async fn listen(
+        state: &Path,
+        direct: Option<SocketAddr>,
+        share_config: bool,
+    ) -> Result<(Self, Endpoint)> {
+        let applied = Applied::load(state)?;
+        let network = applied.network()?;
+        ensure!(
+            network.host == applied.device,
+            "serve must run on '{}'",
+            network.host
+        );
+        let mut publications = BTreeMap::new();
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for (name, share) in &network.shares {
+            let path = applied.base.join(&share.path);
+            let publication = Publication::open(state, name, &path)?;
+            let root = path.canonicalize()?;
+            ensure!(
+                !roots
+                    .iter()
+                    .any(|other| root.starts_with(other) || other.starts_with(&root)),
+                "published roots overlap"
+            );
+            roots.push(root);
+            publications.insert(name.clone(), publication);
+        }
+        for (name, publication) in &mut publications {
+            publication.refresh(&network.host, |path, directory| {
+                network.ignored(&network.shares[name], None, path, directory)
+            })?;
+        }
+        if let Some(address) = direct {
+            ensure!(
+                !address.ip().is_unspecified(),
+                "provide a concrete IP address for --direct"
+            );
+        }
+        let endpoint = wire::bind(access::key(state)?, direct).await?;
+        if direct.is_none() {
+            // A reachable direct address can be used while the relay is still connecting.
+            let _ = tokio::time::timeout(Duration::from_secs(4), endpoint.online()).await;
+        }
+        let address = if let Some(address) = direct {
+            let port = endpoint
+                .bound_sockets()
+                .first()
+                .context("direct socket is unavailable")?
+                .port();
+            iroh::EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::new(address.ip(), port))
+        } else {
+            endpoint.addr()
+        };
+        let destination = Destination {
+            endpoint: address,
+            direct: direct.is_some(),
+            network: network.name.clone(),
+            host: network.host.clone(),
+        };
+        write_json(&state.join("listener.json"), &destination)?;
+        Ok((
+            Self {
+                share_config,
+                state: state.to_owned(),
+                applied,
+                network,
+                destination,
+                publications,
+            },
+            endpoint,
+        ))
+    }
+
+    fn handle(
+        &mut self,
+        peer: EndpointId,
+        request: Request,
+        data: Vec<u8>,
+    ) -> Result<(Answer, Vec<u8>)> {
+        if !matches!(request, Request::Chunk { .. }) {
+            ensure!(data.is_empty(), "unexpected request body");
+        }
+        if let Request::Enroll { token, device } = request {
+            ensure!(
+                self.network.devices.contains(&device) && device != self.network.host,
+                "unknown device"
+            );
+            let registered =
+                access::enroll(&self.state, peer, &token, &device, access::epoch_seconds()?)?;
+            return Ok((Answer::Enrolled(registered.name), Vec::new()));
+        }
+        let device = access::registered(&self.state, peer)?;
+        ensure!(
+            self.network.devices.contains(&device.name),
+            "device has been removed from the network"
+        );
+        let empty = Vec::new();
+        Ok(match request {
+            Request::SharedConfig => {
+                ensure!(
+                    self.share_config,
+                    "host has not enabled shared configuration"
+                );
+                (Answer::SharedConfig(self.applied.source.clone()), empty)
+            }
+            Request::Enroll { .. } => unreachable!(),
+            Request::Issue { template, device } => (
+                Answer::Code(
+                    access::issue(
+                        &self.state,
+                        &self.network,
+                        self.destination.clone(),
+                        Some(peer),
+                        Some(&template),
+                        &device,
+                    )?
+                    .encode()?,
+                ),
+                empty,
+            ),
+            Request::Roots => {
+                let names = self
+                    .publications
+                    .keys()
+                    .filter(|share| permitted(&device, share, Right::Browse))
+                    .cloned()
+                    .collect();
+                (Answer::Names(names), empty)
+            }
+            Request::List { share, directory } => {
+                require(&device, &share, Right::Browse)?;
+                if !directory.is_empty() {
+                    validate_path(&directory)?;
+                }
+                let host = self.applied.device.clone();
+                let definition = self
+                    .network
+                    .shares
+                    .get(&share)
+                    .context("unknown publication")?;
+                let publication = self
+                    .publications
+                    .get_mut(&share)
+                    .context("unknown publication")?;
+                publication.refresh(&host, |path, directory| {
+                    self.network.ignored(definition, None, path, directory)
+                })?;
+                let prefix = if directory.is_empty() {
+                    String::new()
+                } else {
+                    format!("{directory}/")
+                };
+                let mut names = BTreeMap::new();
+                for (path, entry) in publication.heads() {
+                    if entry.blob.is_some()
+                        && let Some(child) = path.strip_prefix(&prefix)
+                    {
+                        match child.split_once('/') {
+                            Some((first, _)) => {
+                                names.insert(first.to_owned(), true);
+                            }
+                            None => {
+                                names.insert(child.to_owned(), false);
+                            }
+                        }
+                    }
+                }
+                ensure!(
+                    directory.is_empty() || !names.is_empty(),
+                    "directory not found"
+                );
+                let names = names
+                    .into_iter()
+                    .map(|(name, dir)| if dir { format!("{name}/") } else { name })
+                    .collect();
+                (Answer::Names(names), empty)
+            }
+            Request::History { share, path } => {
+                require(&device, &share, Right::Browse)?;
+                validate_path(&path)?;
+                let host = self.applied.device.clone();
+                let publication = self.publication(&share)?;
+                publication.refresh_one(&path, &host)?;
+                let versions = publication
+                    .store
+                    .catalog()
+                    .get(&path)
+                    .context("file not found")?;
+                (Answer::History(versions.clone()), empty)
+            }
+            Request::Read {
+                share,
+                path,
+                version,
+                offset,
+                sync,
+            } => {
+                if sync {
+                    let (definition, rule) = self.rule(&device, &share)?;
+                    ensure!(
+                        rule.mode.downloads()
+                            && !self.network.ignored(definition, Some(rule), &path, false),
+                        "file is excluded from synchronization"
+                    );
+                } else {
+                    require(&device, &share, Right::Download)?;
+                }
+                let host = self.applied.device.clone();
+                let publication = self.publication(&share)?;
+                if version.is_none() {
+                    publication.refresh_one(&path, &host)?;
+                }
+                let version = publication.store.version(&path, version)?;
+                let blob = version.blob.as_ref().context("revision is a deletion")?;
+                (
+                    Answer::File(version.clone()),
+                    read_chunk(&publication.store.object(blob)?, offset, blob.size)?,
+                )
+            }
+            Request::Manifest { share } => {
+                let (_, rule) = self.rule(&device, &share)?;
+                ensure!(
+                    rule.mode.downloads(),
+                    "share is upload-only for this device"
+                );
+                let host = self.applied.device.clone();
+                let publication = self
+                    .publications
+                    .get_mut(&share)
+                    .context("unknown publication")?;
+                publication.refresh(&host, |path, directory| {
+                    self.network
+                        .ignored(&self.network.shares[&share], None, path, directory)
+                })?;
+                let mut heads = publication.heads();
+                let (definition, rule) = self.rule(&device, &share)?;
+                heads.retain(|path, _| !self.network.ignored(definition, Some(rule), path, false));
+                (Answer::Manifest(heads), empty)
+            }
+            Request::Prepare { share, path, blob } => {
+                self.upload_rule(&device, &share, &path)?;
+                let object = self.publication(&share)?.store.object(&blob)?;
+                let offset = if object.is_file() {
+                    ensure!(
+                        object.metadata()?.len() == blob.size,
+                        "object size mismatch"
+                    );
+                    blob.size
+                } else {
+                    self.partial(peer, &share, &blob)?.offset()?
+                };
+                (Answer::Offset(offset), empty)
+            }
+            Request::Chunk {
+                share,
+                path,
+                blob,
+                offset,
+            } => {
+                self.upload_rule(&device, &share, &path)?;
+                (
+                    Answer::Offset(self.partial(peer, &share, &blob)?.append(offset, &data)?),
+                    empty,
+                )
+            }
+            Request::Commit {
+                share,
+                path,
+                blob,
+                base,
+            } => {
+                let rule = self.upload_rule(&device, &share, &path)?;
+                ensure!(
+                    blob.is_some() || rule.propagate_delete,
+                    "delete is disabled for this device"
+                );
+                let mirror = rule.mode == Mode::Mirror;
+                let partial = blob
+                    .as_ref()
+                    .map(|blob| self.partial(peer, &share, blob))
+                    .transpose()?;
+                let host = self.applied.device.clone();
+                let publication = self.publication(&share)?;
+                if let Some((blob, partial)) = blob.as_ref().zip(partial.as_ref()) {
+                    let object = publication.store.object(blob)?;
+                    if !object.is_file() {
+                        let verified = publication.store.ingest(partial.verified()?)?;
+                        ensure!(&verified == blob, "uploaded file changed before commit");
+                    }
+                    ensure!(
+                        object.metadata()?.len() == blob.size,
+                        "object size mismatch"
+                    );
+                    partial.remove()?;
+                }
+                let path = publication.commit(Edit {
+                    name: &path,
+                    base,
+                    author: &device.name,
+                    host: &host,
+                    blob,
+                    mirror,
+                })?;
+                (Answer::Committed(path), empty)
+            }
+        })
+    }
+
+    fn publication(&mut self, name: &str) -> Result<&mut Publication> {
+        self.publications
+            .get_mut(name)
+            .context("unknown publication")
+    }
+
+    fn rule(&self, device: &Device, name: &str) -> Result<(&Share, &Rule)> {
+        let share = self
+            .network
+            .shares
+            .get(name)
+            .context("unknown publication")?;
+        let rule = share
+            .rules
+            .get(&device.name)
+            .context("device has no synchronization rule")?;
+        require(device, name, rule.mode.right())?;
+        Ok((share, rule))
+    }
+
+    fn upload_rule(&self, device: &Device, name: &str, path: &str) -> Result<&Rule> {
+        validate_path(path)?;
+        let (share, rule) = self.rule(device, name)?;
+        ensure!(
+            rule.mode.uploads(),
+            "share is download-only for this device"
+        );
+        ensure!(
+            !self.network.ignored(share, Some(rule), path, false),
+            "file is excluded from synchronization"
+        );
+        Ok(rule)
+    }
+
+    fn partial(&self, peer: EndpointId, share: &str, blob: &Blob) -> Result<PartialFile> {
+        PartialFile::new(
+            &self
+                .state
+                .join("shares")
+                .join(share)
+                .join("incoming")
+                .join(peer.to_string()),
+            blob,
+        )
+    }
+}
+
+fn permitted(device: &Device, share: &str, right: Right) -> bool {
+    device
+        .grants
+        .get(share)
+        .is_some_and(|rights| rights.contains(&right))
+}
+
+fn require(device: &Device, share: &str, right: Right) -> Result<()> {
+    ensure!(
+        permitted(device, share, right),
+        "permission denied for '{share}': {right:?}"
+    );
+    Ok(())
+}
+
+pub async fn serve(state: &Path, direct: Option<SocketAddr>, share_config: bool) -> Result<()> {
+    let _lock = lock_directory(&state.join("runtime"))?;
+    let (server, endpoint) = Server::listen(state, direct, share_config).await?;
+    println!("Serving '{}' as {}", server.network.name, endpoint.id());
+    let server = Arc::new(Mutex::new(server));
+    let connections = Arc::new(tokio::sync::Semaphore::new(64));
+    while let Some(incoming) = endpoint.accept().await {
+        let Ok(slot) = connections.clone().try_acquire_owned() else {
+            incoming.refuse();
+            continue;
+        };
+        let server = Arc::clone(&server);
+        tokio::spawn(async move {
+            let _slot = slot;
+            if let Err(error) = handle_connection(incoming.await?, server).await {
+                eprintln!("Connection: {error:#}");
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+    }
+    fs::remove_file(state.join("listener.json"))?;
+    Ok(())
+}
+
+async fn handle_connection(connection: Connection, server: Arc<Mutex<Server>>) -> Result<()> {
+    let peer = connection.remote_id();
+    loop {
+        let Ok(Ok((mut send, mut receive))) =
+            tokio::time::timeout(wire::TIMEOUT, connection.accept_bi()).await
+        else {
+            return Ok(());
+        };
+        let invocation =
+            tokio::time::timeout(wire::TIMEOUT, wire::read_request(&mut receive)).await;
+        let result = match invocation {
+            Ok(Ok((request, data))) => {
+                let server = Arc::clone(&server);
+                tokio::task::spawn_blocking(move || {
+                    server
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("server state unavailable"))?
+                        .handle(peer, request, data)
+                })
+                .await?
+            }
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(error.into()),
+        };
+        tokio::time::timeout(wire::TIMEOUT, wire::reply(&mut send, result)).await??;
+    }
+}

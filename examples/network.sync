@@ -1,0 +1,39 @@
+# Paths are relative to this file on each device.
+network home {
+    device server
+    device phone
+    device pc
+    device laptop
+
+    ignore directory "**/.venv"
+
+    share image {
+        host server at "server-files/photos"
+        archive from phone at "camera" on delete keep on overwrite version
+    }
+
+    share docs {
+        host server at "server-files/docs"
+        mirror laptop at "laptop-files/docs" on delete propagate on conflict keep-both
+    }
+
+    share projects {
+        host server at "server-files/projects"
+        receive from pc at "pc-files/work" on delete keep on overwrite version
+        checkout laptop at "laptop-files/code" {
+            ignore file "**/*.gguf"
+        }
+    }
+
+    permit phone archive, browse, download on image
+    permit pc receive on projects
+    permit laptop mirror, browse, download on docs
+    permit laptop checkout, browse, download on projects
+
+    invitation docs-laptop {
+        issued by server, phone
+        grant browse, download, mirror on docs
+        expires in 15m
+        uses 1
+    }
+}

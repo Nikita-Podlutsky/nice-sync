@@ -1,0 +1,119 @@
+use crate::transfer::CHUNK;
+use anyhow::{Result, ensure};
+use iroh::{
+    Endpoint, EndpointAddr, RelayMode, SecretKey,
+    endpoint::{Connection, RecvStream, SendStream, presets},
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{net::SocketAddr, time::Duration};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const ALPN: &[u8] = b"nice-sync/1";
+const REQUEST_LIMIT: usize = 64 * 1024;
+const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+pub const TIMEOUT: Duration = Duration::from_secs(120);
+
+pub async fn bind(key: SecretKey, direct: Option<SocketAddr>) -> Result<Endpoint> {
+    let builder = match direct {
+        Some(address) => Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr(address)?,
+        None => Endpoint::builder(presets::N0),
+    };
+    Ok(builder
+        .secret_key(key)
+        .alpns(vec![ALPN.to_vec()])
+        .bind()
+        .await?)
+}
+
+pub async fn connect(endpoint: &Endpoint, address: EndpointAddr) -> Result<Connection> {
+    Ok(tokio::time::timeout(Duration::from_secs(25), endpoint.connect(address, ALPN)).await??)
+}
+
+pub async fn read_request<T: DeserializeOwned>(receive: &mut RecvStream) -> Result<(T, Vec<u8>)> {
+    read_packet(receive, REQUEST_LIMIT).await
+}
+
+pub async fn reply<T: Serialize>(
+    send: &mut SendStream,
+    result: Result<(T, Vec<u8>)>,
+) -> Result<()> {
+    match result {
+        Ok((value, data)) => {
+            let response = serde_json::to_vec(&Reply::Success(value))?;
+            if response.len() <= RESPONSE_LIMIT {
+                return send_packet(send, response, &data, RESPONSE_LIMIT).await;
+            }
+            let response: Reply<()> = Reply::Error("response metadata exceeds limit".into());
+            send_packet(send, serde_json::to_vec(&response)?, &[], RESPONSE_LIMIT).await
+        }
+        Err(error) => {
+            let response: Reply<()> = Reply::Error(format!("{error:#}"));
+            send_packet(send, serde_json::to_vec(&response)?, &[], RESPONSE_LIMIT).await
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum Reply<T> {
+    Success(T),
+    Error(String),
+}
+
+pub async fn call<Q: Serialize, A: DeserializeOwned>(
+    connection: &Connection,
+    request: &Q,
+    data: &[u8],
+) -> Result<(A, Vec<u8>)> {
+    tokio::time::timeout(TIMEOUT, async {
+        let (mut send, mut receive) = connection.open_bi().await?;
+        send_packet(&mut send, serde_json::to_vec(request)?, data, REQUEST_LIMIT).await?;
+        let (reply, data) = read_packet(&mut receive, RESPONSE_LIMIT).await?;
+        match reply {
+            Reply::Success(value) => Ok((value, data)),
+            Reply::Error(error) => Err(anyhow::Error::msg(error)),
+        }
+    })
+    .await?
+}
+
+async fn send_packet(
+    send: &mut SendStream,
+    header: Vec<u8>,
+    data: &[u8],
+    limit: usize,
+) -> Result<()> {
+    ensure!(
+        header.len() <= limit && data.len() <= CHUNK,
+        "packet exceeds limit"
+    );
+    send.write_u32(header.len() as u32).await?;
+    send.write_u32(data.len() as u32).await?;
+    send.write_all(&header).await?;
+    send.write_all(data).await?;
+    send.finish()?;
+    Ok(())
+}
+
+async fn read_packet<T: DeserializeOwned>(
+    receive: &mut RecvStream,
+    limit: usize,
+) -> Result<(T, Vec<u8>)> {
+    let header_len = receive.read_u32().await? as usize;
+    let data_len = receive.read_u32().await? as usize;
+    ensure!(
+        header_len <= limit && data_len <= CHUNK,
+        "packet exceeds limit"
+    );
+    let mut header = vec![0; header_len];
+    let mut data = vec![0; data_len];
+    receive.read_exact(&mut header).await?;
+    receive.read_exact(&mut data).await?;
+    ensure!(
+        receive.read(&mut [0]).await?.is_none(),
+        "unexpected packet data"
+    );
+    Ok((serde_json::from_slice(&header)?, data))
+}
