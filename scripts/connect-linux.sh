@@ -2,12 +2,13 @@
 set -euo pipefail
 
 usage() {
-    printf '%s\n' 'Usage: bash scripts/connect-linux.sh [--state DIRECTORY] [--once]'
+    printf '%s\n' 'Usage: bash scripts/connect-linux.sh [--state DIRECTORY] [--once] [--show-route] [--direct IP:PORT]'
 }
 
 client_home="${NICE_SYNC_HOME:-$HOME}"
 state="$client_home/.nice-sync"
 once=false
+route_args=()
 while (($#)); do
     case "$1" in
         --state)
@@ -20,6 +21,18 @@ while (($#)); do
             ;;
         --once)
             once=true
+            shift
+            ;;
+        --direct)
+            if [[ -z "${2:-}" ]]; then
+                usage >&2
+                exit 2
+            fi
+            route_args+=(--direct "$2")
+            shift 2
+            ;;
+        --show-route)
+            route_args+=(--show-route)
             shift
             ;;
         -h|--help)
@@ -58,4 +71,4 @@ sync_args=(--state "$state" sync --follow-config)
 if [[ "$once" == false ]]; then
     sync_args+=(--every 10)
 fi
-exec "$binary" "${sync_args[@]}"
+exec "$binary" "${sync_args[@]}" "${route_args[@]}"

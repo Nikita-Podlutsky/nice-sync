@@ -256,6 +256,50 @@ fn changing_root_at_start_keeps_the_legacy_archive_separate() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn directs_sync_to_an_explicit_socket_without_changing_registration() -> Result<()> {
+    let fixture = Fixture::new(SAMPLE)?;
+    fixture.write("server-files/docs/notes.txt", "downloaded directly")?;
+    fs::create_dir_all(fixture.path("laptop-files/docs"))?;
+    let _host = fixture.listen("127.0.0.1:0", true)?;
+    let code = fixture.join("laptop")?;
+    let address = Code::read(&code)?
+        .destination
+        .endpoint
+        .ip_addrs()
+        .next()
+        .context("missing listening address")?
+        .to_string();
+
+    let state = fixture.path("state-laptop");
+    let mut member = access::Membership::load(&state)?;
+    member.destination.endpoint = iroh::EndpointAddr::new(member.destination.endpoint.id)
+        .with_ip_addr("127.0.0.1:1".parse()?);
+    let file = state.join("joined.json");
+    nice_sync::store::write_json(&file, &member)?;
+    let stored = fs::read(&file)?;
+
+    let result = fixture
+        .command("laptop")
+        .args([
+            "sync",
+            "--follow-config",
+            "--share",
+            "docs",
+            "--direct",
+            &address,
+            "--show-route",
+        ])
+        .output()?;
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains(&format!("Nice Sync route: ip:{address}"))
+    );
+    success(result, "sync through the explicit socket")?;
+    fixture.assert_contents("laptop-files/docs/notes.txt", "downloaded directly")?;
+    assert_eq!(fs::read(file)?, stored);
+    Ok(())
+}
+
 fn success(output: Output, operation: &str) -> Result<String> {
     ensure!(
         output.status.success(),

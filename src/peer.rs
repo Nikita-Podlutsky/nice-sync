@@ -7,6 +7,7 @@ use crate::{
     wire,
 };
 use anyhow::{Context, Result, ensure};
+use futures_util::StreamExt;
 use iroh::{Endpoint, EndpointId, endpoint::Connection};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -112,6 +113,33 @@ impl Client {
 
     pub async fn call(&self, request: Request, data: &[u8]) -> Result<(Answer, Vec<u8>)> {
         wire::call(&self.connection, &request, data).await
+    }
+
+    pub fn trace_route(&self) -> tokio::task::JoinHandle<()> {
+        let connection = self.connection.clone();
+        let mut last = None;
+        let mut report = move |paths: iroh::endpoint::PathList<'_>| {
+            let selected = paths.iter().find(|path| path.is_selected());
+            let address = selected.as_ref().map(|path| path.remote_addr().to_string());
+            if address != last {
+                if let Some(path) = selected {
+                    eprintln!(
+                        "Nice Sync route: {} (RTT {} ms)",
+                        path.remote_addr(),
+                        path.rtt().as_millis()
+                    );
+                }
+                last = address;
+            }
+        };
+        report(connection.paths());
+        tokio::spawn(async move {
+            let paths = connection.paths_stream();
+            tokio::pin!(paths);
+            while let Some(snapshot) = paths.next().await {
+                report(snapshot);
+            }
+        })
     }
 
     pub async fn close(self) {

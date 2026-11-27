@@ -102,6 +102,12 @@ enum Command {
     },
     /// Exchange files for the local device according to the applied policy.
     Sync {
+        /// Connect directly to this IP and UDP port using the registered host key.
+        #[arg(long)]
+        direct: Option<SocketAddr>,
+        /// Print the selected Iroh path and changes to it.
+        #[arg(long)]
+        show_route: bool,
         /// Trust and refresh the host's shared configuration before each sync.
         #[arg(long)]
         follow_config: bool,
@@ -353,14 +359,30 @@ async fn run() -> Result<()> {
             share,
             every,
             follow_config,
+            direct,
+            show_route,
         } => {
             let _lock = lock_directory(&state.join("runtime"))?;
             let member = Membership::load(&state)?;
+            let mut destination = member.destination.clone();
+            if let Some(address) = direct {
+                ensure!(
+                    !address.ip().is_unspecified() && address.port() != 0,
+                    "provide a concrete host IP and nonzero UDP port"
+                );
+                destination.endpoint =
+                    iroh::EndpointAddr::new(destination.endpoint.id).with_ip_addr(address);
+                destination.direct = true;
+            }
             loop {
                 let result = async {
-                    let client = Client::connect(&state, &member.destination).await?;
+                    let client = Client::connect(&state, &destination).await?;
+                    let route = show_route.then(|| client.trace_route());
                     let result =
                         sync_once(&client, &state, &member, follow_config, share.as_deref()).await;
+                    if let Some(route) = route {
+                        route.abort();
+                    }
                     client.close().await;
                     result
                 }
