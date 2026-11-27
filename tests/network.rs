@@ -135,12 +135,33 @@ impl Fixture {
 fn join_uses_host_policy_and_follows_updates() -> Result<()> {
     let fixture = Fixture::new(SAMPLE)?;
     fixture.write("server-files/docs/notes.txt", "from the host")?;
+    for number in 0..12 {
+        fixture.write(
+            &format!("server-files/docs/item-{number:02}.txt"),
+            format!("item {number}"),
+        )?;
+    }
+    fixture.write("server-files/docs/copy-a.txt", "same bytes")?;
+    fixture.write("server-files/docs/copy-b.txt", "same bytes")?;
     fs::create_dir_all(fixture.path("laptop-files/docs"))?;
     let mut host = fixture.listen("127.0.0.1:0", true)?;
     let invitation = fixture.run("server", &["invite", "--configured", "--device", "laptop"])?;
     fixture.run("laptop", &["join", "--sync", invitation.trim()])?;
     assert!(!fixture.path("state-laptop/applied.json").exists());
     fixture.assert_contents("laptop-files/docs/notes.txt", "from the host")?;
+    for number in 0..12 {
+        fixture.assert_contents(
+            &format!("laptop-files/docs/item-{number:02}.txt"),
+            &format!("item {number}"),
+        )?;
+    }
+    fixture.assert_contents("laptop-files/docs/copy-a.txt", "same bytes")?;
+    fixture.assert_contents("laptop-files/docs/copy-b.txt", "same bytes")?;
+    assert!(
+        fixture
+            .run("laptop", &["sync", "--follow-config", "--share", "docs"])?
+            .contains("0 changes")
+    );
     fixture.assert_contents("state-laptop/shared.sync", SAMPLE)?;
 
     fs::write(&fixture.config, "network home {")?;

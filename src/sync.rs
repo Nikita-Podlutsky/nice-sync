@@ -6,12 +6,16 @@ use crate::{
     transfer::{PartialFile, read_chunk},
 };
 use anyhow::{Context, Result, bail, ensure};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
+
+const DOWNLOAD_WINDOW: usize = 8;
 
 #[derive(Default, Deserialize, Serialize)]
 struct Tracked {
@@ -109,6 +113,9 @@ impl Job<'_> {
         fs::create_dir_all(&self.directory)?;
         let tracking_file = self.directory.join("tracking.json");
         let mut tracking: Tracking = read_json(&tracking_file)?;
+        if tracking.is_empty() {
+            eprintln!("{}: scanning local files", self.share);
+        }
         let files = scan(&self.root, &ignored)?;
         let before = files
             .iter()
@@ -151,6 +158,9 @@ impl Job<'_> {
         if !self.mode.downloads() {
             return Ok(count);
         }
+        if tracking.is_empty() {
+            eprintln!("{}: requesting the file list from the host", self.share);
+        }
         let (answer, _) = self
             .client
             .call(
@@ -164,65 +174,133 @@ impl Job<'_> {
             bail!("expected publication manifest")
         };
         // Remove files first so a former file can become a parent directory.
-        let changes = heads
+        let should_download = |path: &str, version: &Version, tracking: &Tracking| {
+            let prior = before.get(path);
+            version
+                .blob
+                .as_ref()
+                .is_some_and(|blob| Some(blob) != prior)
+                && (self.mode != Mode::Checkout
+                    || prior.is_none()
+                    || tracking.get(path).and_then(|entry| entry.local.as_ref()) == prior)
+        };
+        let total = heads
+            .iter()
+            .filter(|(path, version)| {
+                !ignored(path, false) && should_download(path, version, &tracking)
+            })
+            .count();
+        if total > 0 {
+            eprintln!("{}: downloading {total} files", self.share);
+        }
+        let download_directory = self.directory.join("download");
+        let mut completed = 0;
+        let mut bytes = 0;
+        let mut last_progress = Instant::now();
+        let mut changes = heads
             .iter()
             .filter(|(_, version)| version.blob.is_none())
-            .chain(heads.iter().filter(|(_, version)| version.blob.is_some()));
+            .chain(heads.iter().filter(|(_, version)| version.blob.is_some()))
+            .filter(|(path, _)| !ignored(path, false))
+            .peekable();
         let mut skipped = Vec::new();
-        for (path, version) in changes {
-            if ignored(path, false) {
-                continue;
+        while changes.peek().is_some() {
+            let mut batch = Vec::with_capacity(DOWNLOAD_WINDOW);
+            let mut hashes = BTreeSet::new();
+            while batch.len() < DOWNLOAD_WINDOW {
+                let Some(&(path, version)) = changes.peek() else {
+                    break;
+                };
+                let download = should_download(path, version, &tracking);
+                // The temporary file is shared by all paths with the same content.
+                if download
+                    && let Some(blob) = &version.blob
+                    && !hashes.insert(&blob.hash)
+                {
+                    break;
+                }
+                changes.next();
+                batch.push((path, version, download));
             }
-            let prior = before.get(path);
-            let actual = local_blob(&self.root, path)?;
-            if actual.as_ref() != prior {
-                skipped.push(format!("{path} changed during synchronization"));
-                continue;
-            }
-            let keep = self.mode == Mode::Mirror && !self.propagate && version.blob.is_none();
-            if !keep && actual != version.blob {
-                let previous = tracking.get(path).and_then(|entry| entry.local.as_ref());
-                if self.mode == Mode::Checkout && actual.is_some() && actual.as_ref() != previous {
-                    skipped.push(format!(
-                        "{path} has local changes; move it aside before retrying"
-                    ));
+            let incoming = join_all(batch.iter().map(|&(path, version, download)| {
+                let directory = &download_directory;
+                async move {
+                    if download {
+                        fetch(self.client, directory, self.share, path, version, true)
+                            .await
+                            .map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                }
+            }))
+            .await;
+            for ((path, version, _), partial) in batch.into_iter().zip(incoming) {
+                let prior = before.get(path);
+                if prior == version.blob.as_ref()
+                    && tracking.get(path).is_some_and(|entry| {
+                        entry.local.as_ref() == prior && entry.remote == Some(version.id)
+                    })
+                {
                     continue;
                 }
-                match &version.blob {
-                    Some(blob) => {
-                        let partial = fetch(
-                            self.client,
-                            &self.directory.join("download"),
-                            self.share,
-                            path,
-                            version,
-                            true,
-                        )
-                        .await?;
-                        if local_blob(&self.root, path)? != actual {
-                            skipped.push(format!("{path} changed during download"));
-                            continue;
-                        }
-                        install(&self.root, path, partial.verified()?, blob)?;
-                        partial.remove()?;
-                    }
-                    None => remove(&self.root, path)?,
+                let actual = local_blob(&self.root, path)?;
+                if actual.as_ref() != prior {
+                    skipped.push(format!("{path} changed during synchronization"));
+                    continue;
                 }
-                count += 1;
-            }
-            let local = if keep { actual } else { version.blob.clone() };
-            if tracking
-                .get(path)
-                .is_none_or(|entry| entry.local != local || entry.remote != Some(version.id))
-            {
-                tracking.insert(
-                    path.clone(),
-                    Tracked {
-                        local,
-                        remote: Some(version.id),
-                    },
-                );
-                write_json(&tracking_file, &tracking)?;
+                let keep = self.mode == Mode::Mirror && !self.propagate && version.blob.is_none();
+                if !keep && actual != version.blob {
+                    let previous = tracking.get(path).and_then(|entry| entry.local.as_ref());
+                    if self.mode == Mode::Checkout
+                        && actual.is_some()
+                        && actual.as_ref() != previous
+                    {
+                        skipped.push(format!(
+                            "{path} has local changes; move it aside before retrying"
+                        ));
+                        continue;
+                    }
+                    match &version.blob {
+                        Some(blob) => {
+                            let partial = partial?.context("missing downloaded file")?;
+                            if local_blob(&self.root, path)? != actual {
+                                skipped.push(format!("{path} changed during download"));
+                                continue;
+                            }
+                            install(&self.root, path, partial.verified()?, blob)?;
+                            partial.remove()?;
+                            completed += 1;
+                            bytes += blob.size;
+                            if completed == total
+                                || last_progress.elapsed() >= Duration::from_secs(2)
+                            {
+                                eprintln!(
+                                    "{}: downloaded {completed}/{total} files ({:.1} MiB)",
+                                    self.share,
+                                    bytes as f64 / (1024.0 * 1024.0)
+                                );
+                                last_progress = Instant::now();
+                            }
+                        }
+                        None => remove(&self.root, path)?,
+                    }
+                    count += 1;
+                }
+                let local = if keep { actual } else { version.blob.clone() };
+                if tracking
+                    .get(path)
+                    .is_none_or(|entry| entry.local != local || entry.remote != Some(version.id))
+                {
+                    tracking.insert(
+                        path.clone(),
+                        Tracked {
+                            local,
+                            remote: Some(version.id),
+                        },
+                    );
+                    write_json(&tracking_file, &tracking)?;
+                }
             }
         }
         ensure!(skipped.is_empty(), "{}", skipped.join("\n"));
@@ -347,6 +425,7 @@ async fn fetch(
     let blob = version.blob.as_ref().context("file has been deleted")?;
     let partial = PartialFile::new(directory, blob)?;
     let mut offset = partial.offset()?;
+    let mut last_progress = Instant::now();
     while offset < blob.size {
         let (answer, data) = client
             .call(
@@ -365,6 +444,14 @@ async fn fetch(
         };
         ensure!(current == *version, "unexpected file revision");
         offset = partial.append(offset, &data)?;
+        if blob.size >= 32 * 1024 * 1024 && last_progress.elapsed() >= Duration::from_secs(2) {
+            eprintln!(
+                "{share}/{path}: {:.0}/{:.0} MiB",
+                offset as f64 / (1024.0 * 1024.0),
+                blob.size as f64 / (1024.0 * 1024.0)
+            );
+            last_progress = Instant::now();
+        }
     }
     Ok(partial)
 }
