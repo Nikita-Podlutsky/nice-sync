@@ -4,6 +4,7 @@ use crate::store::{
 };
 use anyhow::{Context, Result, ensure};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io,
@@ -113,60 +114,67 @@ impl Publication {
             .cloned()
             .collect::<BTreeSet<_>>();
         // Process removals before additions, including a file replaced by a directory.
-        for name in names
+        let paths = names
             .iter()
             .filter(|name| !files.contains_key(*name) && !ignored(name, false))
             .chain(files.keys())
-        {
-            let file = files.get(name);
-            let actual = file
-                .map(|path| fingerprint(&mut File::open(path)?))
-                .transpose()?;
-            self.refresh_path(name, actual, host)?;
-        }
-        Ok(())
+            .map(|name| {
+                let actual = files
+                    .get(name)
+                    .map(|path| fingerprint(&mut File::open(path)?))
+                    .transpose()?;
+                Ok((name.as_str(), actual))
+            });
+        self.refresh_paths(host, paths)
     }
 
     pub fn refresh_one(&mut self, name: &str, host: &str) -> Result<()> {
         let actual = local_blob(&self.location.root, name)?;
-        self.refresh_path(name, actual, host)
+        self.refresh_paths(host, [Ok((name, actual))])
     }
 
-    fn refresh_path(&mut self, name: &str, actual: Option<Blob>, host: &str) -> Result<()> {
-        let current = self
-            .store
-            .catalog()
-            .get(name)
-            .and_then(|versions| versions.last())
-            .cloned();
-        let head = current.as_ref().and_then(|version| version.blob.as_ref());
-        if actual.as_ref() == head {
-            return self.remember(name, actual);
+    fn refresh_paths<'a>(
+        &mut self,
+        host: &str,
+        paths: impl IntoIterator<Item = Result<(&'a str, Option<Blob>)>>,
+    ) -> Result<()> {
+        let mut catalog = Cow::Borrowed(self.store.catalog());
+        let mut projection = Cow::Borrowed(&self.location.projection);
+        for entry in paths {
+            let (name, actual) = entry?;
+            let current = catalog.get(name).and_then(|versions| versions.last());
+            let head = current.and_then(|version| version.blob.as_ref());
+            let next = if actual.as_ref() == head {
+                actual
+            } else if actual.as_ref() == projection.get(name) {
+                self.project_file(name, head, actual.as_ref())?;
+                head.cloned()
+            } else {
+                if let Some(actual) = &actual {
+                    ensure_portable_catalog(&catalog, name)?;
+                    let blob = self.store.ingest(&local_path(&self.location.root, name)?)?;
+                    ensure!(&blob == actual, "file changed during scan: {name}");
+                }
+                let parent = current.map(|version| version.id);
+                push_version(
+                    catalog.to_mut().entry(name.to_owned()).or_default(),
+                    parent,
+                    host,
+                    actual.clone(),
+                );
+                actual
+            };
+            if projection.get(name) != next.as_ref() {
+                update_projection(projection.to_mut(), name, next);
+            }
         }
-        if actual.as_ref() == self.location.projection.get(name) {
-            return self.project(name, head, actual.as_ref());
+        if let Cow::Owned(catalog) = catalog {
+            self.store.save(catalog)?;
         }
-        let blob = actual
-            .as_ref()
-            .map(|actual| {
-                let blob = self.store.ingest(&local_path(&self.location.root, name)?)?;
-                ensure!(&blob == actual, "file changed during scan: {name}");
-                Ok::<_, anyhow::Error>(blob)
-            })
-            .transpose()?;
-        let parent = current.map(|version| version.id);
-        let mut catalog = self.store.catalog().clone();
-        if blob.is_some() {
-            ensure_portable_catalog(&catalog, name)?;
+        if let Cow::Owned(projection) = projection {
+            self.save_projection(projection)?;
         }
-        push_version(
-            catalog.entry(name.to_owned()).or_default(),
-            parent,
-            host,
-            blob,
-        );
-        self.store.save(catalog)?;
-        self.remember(name, actual)
+        Ok(())
     }
 
     pub fn commit(&mut self, edit: Edit<'_>) -> Result<String> {
@@ -234,30 +242,35 @@ impl Publication {
     }
 
     fn project(&mut self, name: &str, blob: Option<&Blob>, previous: Option<&Blob>) -> Result<()> {
+        self.project_file(name, blob, previous)?;
+        let mut projection = self.location.projection.clone();
+        update_projection(&mut projection, name, blob.cloned());
+        self.save_projection(projection)
+    }
+
+    fn project_file(&self, name: &str, blob: Option<&Blob>, previous: Option<&Blob>) -> Result<()> {
         ensure!(
             local_blob(&self.location.root, name)?.as_ref() == previous,
             "host file changed during sync: {name}"
         );
         match blob {
-            Some(blob) => install(&self.location.root, name, &self.store.object(blob)?, blob)?,
-            None => remove(&self.location.root, name)?,
+            Some(blob) => install(&self.location.root, name, &self.store.object(blob)?, blob),
+            None => remove(&self.location.root, name),
         }
-        self.remember(name, blob.cloned())
     }
 
-    fn remember(&mut self, name: &str, blob: Option<Blob>) -> Result<()> {
-        if self.location.projection.get(name) == blob.as_ref() {
-            return Ok(());
-        }
-        match blob {
-            Some(blob) => {
-                self.location.projection.insert(name.to_owned(), blob);
-            }
-            None => {
-                self.location.projection.remove(name);
-            }
-        }
-        write_json(&self.location.projection_file, &self.location.projection)
+    fn save_projection(&mut self, projection: BTreeMap<String, Blob>) -> Result<()> {
+        write_json(&self.location.projection_file, &projection)?;
+        self.location.projection = projection;
+        Ok(())
+    }
+}
+
+fn update_projection(projection: &mut BTreeMap<String, Blob>, name: &str, blob: Option<Blob>) {
+    if let Some(blob) = blob {
+        projection.insert(name.to_owned(), blob);
+    } else {
+        projection.remove(name);
     }
 }
 

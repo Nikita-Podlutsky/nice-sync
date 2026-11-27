@@ -1,5 +1,5 @@
 use crate::transfer::CHUNK;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey,
     endpoint::{Connection, RecvStream, SendStream, presets},
@@ -29,7 +29,11 @@ pub async fn bind(key: SecretKey, direct: Option<SocketAddr>) -> Result<Endpoint
 }
 
 pub async fn connect(endpoint: &Endpoint, address: EndpointAddr) -> Result<Connection> {
-    Ok(tokio::time::timeout(Duration::from_secs(25), endpoint.connect(address, ALPN)).await??)
+    Ok(
+        tokio::time::timeout(Duration::from_secs(25), endpoint.connect(address, ALPN))
+            .await
+            .context("timed out connecting to the Nice Sync host (25 seconds)")??,
+    )
 }
 
 pub async fn read_request<T: DeserializeOwned>(receive: &mut RecvStream) -> Result<(T, Vec<u8>)> {
@@ -76,7 +80,8 @@ pub async fn call<Q: Serialize, A: DeserializeOwned>(
             Reply::Error(error) => Err(anyhow::Error::msg(error)),
         }
     })
-    .await?
+    .await
+    .context("timed out waiting for the Nice Sync host to answer (120 seconds)")?
 }
 
 async fn send_packet(

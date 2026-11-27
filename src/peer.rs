@@ -142,15 +142,11 @@ impl Server {
             "serve must run on '{}'",
             network.host
         );
-        let mut publications = publication_locations(state, &applied, &network)?
+        println!("Opening publications for '{}'", network.name);
+        let publications = publication_locations(state, &applied, &network)?
             .into_iter()
             .map(|(name, location)| Ok((name, Publication::open(location)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        for (name, publication) in &mut publications {
-            publication.refresh(&network.host, |path, directory| {
-                network.ignored(&network.shares[name], None, path, directory)
-            })?;
-        }
         if let Some(address) = direct {
             ensure!(
                 !address.ip().is_unspecified(),

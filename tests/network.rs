@@ -202,14 +202,31 @@ fn wait_for_config(fixture: &Fixture, host: &mut Host, source: &str) -> Result<(
 fn changing_root_at_start_keeps_the_legacy_archive_separate() -> Result<()> {
     let fixture = Fixture::new(SAMPLE)?;
     fixture.write("server-files/docs/old.txt", "legacy archive")?;
-    drop(fixture.host()?);
+    let host = fixture.host()?;
+    let invitation = Code::read(&fixture.join("laptop")?)?;
+    let address = invitation
+        .destination
+        .endpoint
+        .ip_addrs()
+        .next()
+        .context("missing listening address")?
+        .to_string();
+    assert_eq!(
+        fixture.run("laptop", &["ls", "server:/docs"])?.trim(),
+        "old.txt"
+    );
+    drop(host);
     fs::remove_file(fixture.path("state-server/listener.json"))?;
     fs::remove_file(fixture.path("state-server/shares/docs/primary-root.json"))?;
 
     let moved = SAMPLE.replace("\"server-files/docs\"", "\"server-files/Учеба\"");
     fs::write(&fixture.config, &moved)?;
     fixture.write("server-files/Учеба/lesson.txt", "new archive")?;
-    let _host = fixture.host()?;
+    let _host = fixture.listen(&address, false)?;
+    assert_eq!(
+        fixture.run("laptop", &["ls", "server:/docs"])?.trim(),
+        "lesson.txt"
+    );
     assert!(!fixture.path("server-files/Учеба/old.txt").exists());
     fixture.assert_contents("server-files/docs/old.txt", "legacy archive")?;
     let legacy = fs::read_to_string(fixture.path("state-server/shares/docs/catalog.json"))?;
@@ -491,7 +508,10 @@ fn delegated_invitations_only_grant_the_template_permissions() -> Result<()> {
     fixture.write("server-files/docs/.venv/cache.txt", "only by explicit path")?;
     let _host = fixture.host()?;
     let catalog = fixture.path("state-server/shares/docs/catalog.json");
-    assert!(!fs::read_to_string(&catalog)?.contains(".venv"));
+    assert!(
+        !catalog.exists(),
+        "host should listen before scanning publications"
+    );
     fixture.join("phone")?;
     let code = fixture.run(
         "phone",
@@ -512,6 +532,10 @@ fn delegated_invitations_only_grant_the_template_permissions() -> Result<()> {
     assert!(lines.count() > 1, "QR code was not printed");
     assert!(!fixture.path("state-laptop/applied.json").exists());
     assert_eq!(fixture.run("laptop", &["ls"])?.trim(), "docs");
+    assert!(
+        !catalog.exists(),
+        "listing publications does not scan their files"
+    );
     assert_eq!(
         fixture.run("laptop", &["ls", "server:/docs"])?.trim(),
         "readme.txt"
