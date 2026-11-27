@@ -649,6 +649,8 @@ pub struct Applied {
     pub source: String,
     pub base: PathBuf,
     pub device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
 }
 
 impl Applied {
@@ -665,6 +667,7 @@ impl Applied {
             source,
             base,
             device,
+            file: Some(file),
         };
         candidate.network()?;
         Ok(candidate)

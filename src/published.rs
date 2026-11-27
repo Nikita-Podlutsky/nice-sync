@@ -14,13 +14,17 @@ pub type Heads = BTreeMap<String, Version>;
 
 pub struct Publication {
     pub store: Store,
-    root: PathBuf,
+    pub(crate) location: Location,
+}
+
+pub(crate) struct Location {
+    pub(crate) root: PathBuf,
     projection_file: PathBuf,
     projection: BTreeMap<String, Blob>,
 }
 
-impl Publication {
-    pub fn open(state: &Path, name: &str, path: &Path) -> Result<Self> {
+impl Location {
+    pub(crate) fn prepare(state: &Path, name: &str, path: &Path) -> Result<Self> {
         fs::create_dir_all(path)?;
         let metadata = fs::symlink_metadata(path)?;
         ensure!(
@@ -35,16 +39,26 @@ impl Publication {
             "publication root and Nice Sync state overlap"
         );
         let directory = state.join("shares").join(name);
-        let store = Store::open(&directory)?;
         let root_id = blake3::hash(root.as_os_str().as_encoded_bytes());
         let projection_file = directory.join(format!("projection-{root_id}.json"));
         let projection = read_json(&projection_file)?;
         Ok(Self {
-            store,
             root,
             projection_file,
             projection,
         })
+    }
+}
+
+impl Publication {
+    pub(crate) fn open(location: Location) -> Result<Self> {
+        let store = Store::open(
+            location
+                .projection_file
+                .parent()
+                .context("missing store directory")?,
+        )?;
+        Ok(Self { store, location })
     }
 
     pub fn heads(&self) -> Heads {
@@ -60,7 +74,7 @@ impl Publication {
     }
 
     pub fn refresh(&mut self, host: &str, ignored: impl Fn(&str, bool) -> bool) -> Result<()> {
-        let files = scan(&self.root, &ignored)?;
+        let files = scan(&self.location.root, &ignored)?;
         let names = files
             .keys()
             .chain(self.store.catalog().keys())
@@ -82,7 +96,7 @@ impl Publication {
     }
 
     pub fn refresh_one(&mut self, name: &str, host: &str) -> Result<()> {
-        let actual = local_blob(&self.root, name)?;
+        let actual = local_blob(&self.location.root, name)?;
         self.refresh_path(name, actual, host)
     }
 
@@ -97,13 +111,13 @@ impl Publication {
         if actual.as_ref() == head {
             return self.remember(name, actual);
         }
-        if actual.as_ref() == self.projection.get(name) {
+        if actual.as_ref() == self.location.projection.get(name) {
             return self.project(name, head, actual.as_ref());
         }
         let blob = actual
             .as_ref()
             .map(|actual| {
-                let blob = self.store.ingest(&local_path(&self.root, name)?)?;
+                let blob = self.store.ingest(&local_path(&self.location.root, name)?)?;
                 ensure!(&blob == actual, "file changed during scan: {name}");
                 Ok::<_, anyhow::Error>(blob)
             })
@@ -189,29 +203,29 @@ impl Publication {
 
     fn project(&mut self, name: &str, blob: Option<&Blob>, previous: Option<&Blob>) -> Result<()> {
         ensure!(
-            local_blob(&self.root, name)?.as_ref() == previous,
+            local_blob(&self.location.root, name)?.as_ref() == previous,
             "host file changed during sync: {name}"
         );
         match blob {
-            Some(blob) => install(&self.root, name, &self.store.object(blob)?, blob)?,
-            None => remove(&self.root, name)?,
+            Some(blob) => install(&self.location.root, name, &self.store.object(blob)?, blob)?,
+            None => remove(&self.location.root, name)?,
         }
         self.remember(name, blob.cloned())
     }
 
     fn remember(&mut self, name: &str, blob: Option<Blob>) -> Result<()> {
-        if self.projection.get(name) == blob.as_ref() {
+        if self.location.projection.get(name) == blob.as_ref() {
             return Ok(());
         }
         match blob {
             Some(blob) => {
-                self.projection.insert(name.to_owned(), blob);
+                self.location.projection.insert(name.to_owned(), blob);
             }
             None => {
-                self.projection.remove(name);
+                self.location.projection.remove(name);
             }
         }
-        write_json(&self.projection_file, &self.projection)
+        write_json(&self.location.projection_file, &self.location.projection)
     }
 }
 

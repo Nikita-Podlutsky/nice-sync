@@ -392,6 +392,7 @@ async fn sync_once(
             source,
             base: std::env::current_dir()?,
             device: member.device.clone(),
+            file: None,
         }
     } else {
         Applied::load(state)?

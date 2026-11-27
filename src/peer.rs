@@ -1,7 +1,7 @@
 use crate::{
     access::{self, Destination, Device},
     language::{Applied, Mode, Network, Right, Rule, Share},
-    published::{Edit, Heads, Publication},
+    published::{Edit, Heads, Location, Publication},
     store::{Blob, Version, lock_directory, validate_path, write_json},
     transfer::{PartialFile, read_chunk},
     wire,
@@ -141,21 +141,10 @@ impl Server {
             "serve must run on '{}'",
             network.host
         );
-        let mut publications = BTreeMap::new();
-        let mut roots: Vec<PathBuf> = Vec::new();
-        for (name, share) in &network.shares {
-            let path = applied.base.join(&share.path);
-            let publication = Publication::open(state, name, &path)?;
-            let root = path.canonicalize()?;
-            ensure!(
-                !roots
-                    .iter()
-                    .any(|other| root.starts_with(other) || other.starts_with(&root)),
-                "published roots overlap"
-            );
-            roots.push(root);
-            publications.insert(name.clone(), publication);
-        }
+        let mut publications = publication_locations(state, &applied, &network)?
+            .into_iter()
+            .map(|(name, location)| Ok((name, Publication::open(location)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
         for (name, publication) in &mut publications {
             publication.refresh(&network.host, |path, directory| {
                 network.ignored(&network.shares[name], None, path, directory)
@@ -200,6 +189,49 @@ impl Server {
             },
             endpoint,
         ))
+    }
+
+    fn reload(&mut self, path: &Path) -> Result<bool> {
+        let source = fs::read_to_string(path)?;
+        if source == self.applied.source {
+            return Ok(false);
+        }
+        let candidate = Applied {
+            source,
+            base: self.applied.base.clone(),
+            device: self.applied.device.clone(),
+            file: Some(path.to_owned()),
+        };
+        let network = candidate.network()?;
+        ensure!(
+            network.host == self.network.host && network.name == self.network.name,
+            "a live update must use the same network and host"
+        );
+
+        let mut added = BTreeMap::new();
+        let mut moved = BTreeMap::new();
+        for (name, location) in publication_locations(&self.state, &candidate, &network)? {
+            if let Some(existing) = self.publications.get(&name) {
+                if existing.location.root != location.root {
+                    moved.insert(name, location);
+                }
+            } else {
+                added.insert(name, Publication::open(location)?);
+            }
+        }
+        candidate.save(&self.state)?;
+        self.publications
+            .retain(|name, _| network.shares.contains_key(name));
+        for (name, location) in moved {
+            self.publications
+                .get_mut(&name)
+                .expect("previously opened publication")
+                .location = location;
+        }
+        self.publications.extend(added);
+        self.applied = candidate;
+        self.network = network;
+        Ok(true)
     }
 
     fn handle(
@@ -484,6 +516,26 @@ impl Server {
     }
 }
 
+fn publication_locations(
+    state: &Path,
+    applied: &Applied,
+    network: &Network,
+) -> Result<BTreeMap<String, Location>> {
+    let mut locations = BTreeMap::<String, Location>::new();
+    for (name, share) in &network.shares {
+        let location = Location::prepare(state, name, &applied.base.join(&share.path))?;
+        ensure!(
+            !locations
+                .values()
+                .any(|other| location.root.starts_with(&other.root)
+                    || other.root.starts_with(&location.root)),
+            "published roots overlap"
+        );
+        locations.insert(name.clone(), location);
+    }
+    Ok(locations)
+}
+
 fn permitted(device: &Device, share: &str, right: Right) -> bool {
     device
         .grants
@@ -503,7 +555,15 @@ pub async fn serve(state: &Path, direct: Option<SocketAddr>, share_config: bool)
     let _lock = lock_directory(&state.join("runtime"))?;
     let (server, endpoint) = Server::listen(state, direct, share_config).await?;
     println!("Serving '{}' as {}", server.network.name, endpoint.id());
+    let source = server.applied.file.clone().filter(|_| share_config);
+    if share_config && source.is_none() {
+        eprintln!("Live configuration requires applying the source file once with this version.");
+    }
     let server = Arc::new(Mutex::new(server));
+    let watcher = source.map(|source| {
+        println!("Watching {}", source.display());
+        tokio::spawn(watch_config(Arc::clone(&server), source))
+    });
     let connections = Arc::new(tokio::sync::Semaphore::new(64));
     while let Some(incoming) = endpoint.accept().await {
         let Ok(slot) = connections.clone().try_acquire_owned() else {
@@ -519,8 +579,46 @@ pub async fn serve(state: &Path, direct: Option<SocketAddr>, share_config: bool)
             Ok::<_, anyhow::Error>(())
         });
     }
+    if let Some(watcher) = watcher {
+        watcher.abort();
+    }
     fs::remove_file(state.join("listener.json"))?;
     Ok(())
+}
+
+async fn watch_config(server: Arc<Mutex<Server>>, source: PathBuf) {
+    let mut last_error = None;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let server = Arc::clone(&server);
+        let path = source.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            server
+                .lock()
+                .map_err(|_| anyhow::anyhow!("server state unavailable"))?
+                .reload(&path)
+        })
+        .await;
+        match result {
+            Ok(Ok(changed)) => {
+                last_error = None;
+                if changed {
+                    println!("Reloaded {}", source.display());
+                }
+            }
+            Ok(Err(error)) => {
+                let message = format!("{error:#}");
+                if last_error.as_ref() != Some(&message) {
+                    eprintln!(
+                        "Configuration reload failed for {} ({message})",
+                        source.display()
+                    );
+                    last_error = Some(message);
+                }
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 async fn handle_connection(connection: Connection, server: Arc<Mutex<Server>>) -> Result<()> {

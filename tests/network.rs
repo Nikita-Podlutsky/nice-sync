@@ -136,22 +136,17 @@ fn join_uses_host_policy_and_follows_updates() -> Result<()> {
     let fixture = Fixture::new(SAMPLE)?;
     fixture.write("server-files/docs/notes.txt", "from the host")?;
     fs::create_dir_all(fixture.path("laptop-files/docs"))?;
-    let host = fixture.listen("127.0.0.1:0", true)?;
+    let mut host = fixture.listen("127.0.0.1:0", true)?;
     let invitation = fixture.run("server", &["invite", "--configured", "--device", "laptop"])?;
-    let address = Code::read(invitation.trim())?
-        .destination
-        .endpoint
-        .ip_addrs()
-        .next()
-        .context("missing listening address")?
-        .to_string();
     fixture.run("laptop", &["join", "--sync", invitation.trim()])?;
     assert!(!fixture.path("state-laptop/applied.json").exists());
     fixture.assert_contents("laptop-files/docs/notes.txt", "from the host")?;
     fixture.assert_contents("state-laptop/shared.sync", SAMPLE)?;
 
-    drop(host);
-    fs::remove_file(fixture.path("state-server/listener.json"))?;
+    fs::write(&fixture.config, "network home {")?;
+    thread::sleep(Duration::from_millis(1200));
+    fixture.run("laptop", &["sync", "--follow-config"])?;
+    fixture.assert_contents("state-laptop/shared.sync", SAMPLE)?;
     let updated = SAMPLE.replace(
         "ignore directory \"**/.venv\"",
         "ignore directory \"**/.venv\"\n    ignore file \"**/skip.txt\"",
@@ -159,7 +154,20 @@ fn join_uses_host_policy_and_follows_updates() -> Result<()> {
     fs::write(&fixture.config, &updated)?;
     fixture.write("server-files/docs/skip.txt", "excluded by the new policy")?;
     fixture.write("server-files/docs/notes.txt", "updated")?;
-    let _host = fixture.listen(&address, true)?;
+    let active = fixture.path("state-server/applied.json");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let applied: Applied = nice_sync::store::read_json(&active)?;
+        if applied.source == updated {
+            break;
+        }
+        ensure!(host.0.try_wait()?.is_none(), "host exited during reload");
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "host did not reload the configuration"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     fixture.run("laptop", &["sync", "--follow-config"])?;
     fixture.assert_contents("state-laptop/shared.sync", &updated)?;
     fixture.assert_contents("laptop-files/docs/notes.txt", "updated")?;
