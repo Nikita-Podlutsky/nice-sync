@@ -1,12 +1,12 @@
 use crate::{
     language::{Applied, Mode, Network},
     peer::{Answer, Client, Request},
-    published::{install, local_blob, remove},
+    published::{install, install_bytes, local_blob, remove},
     store::{Blob, Version, copy_verified, fingerprint, is_link, read_json, scan, write_json},
-    transfer::{PartialFile, read_chunk},
+    transfer::{PartialFile, SMALL_BATCH, SMALL_FILE, read_chunk},
 };
 use anyhow::{Context, Result, bail, ensure};
-use futures_util::future::join_all;
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -161,6 +161,7 @@ impl Job<'_> {
         if tracking.is_empty() {
             eprintln!("{}: requesting the file list from the host", self.share);
         }
+        let manifest_started = Instant::now();
         let (answer, _) = self
             .client
             .call(
@@ -173,6 +174,13 @@ impl Job<'_> {
         let Answer::Manifest(heads) = answer else {
             bail!("expected publication manifest")
         };
+        if manifest_started.elapsed() >= Duration::from_secs(2) {
+            eprintln!(
+                "{}: received the file list in {:.1}s",
+                self.share,
+                manifest_started.elapsed().as_secs_f64()
+            );
+        }
         // Remove files first so a former file can become a parent directory.
         let should_download = |path: &str, version: &Version, tracking: &Tracking| {
             let prior = before.get(path);
@@ -183,6 +191,13 @@ impl Job<'_> {
                 && (self.mode != Mode::Checkout
                     || prior.is_none()
                     || tracking.get(path).and_then(|entry| entry.local.as_ref()) == prior)
+        };
+        let can_pack = |path: &str, version: &Version| {
+            path.len() <= 512
+                && version
+                    .blob
+                    .as_ref()
+                    .is_some_and(|blob| blob.size <= SMALL_FILE)
         };
         let total = heads
             .iter()
@@ -197,21 +212,37 @@ impl Job<'_> {
         let mut completed = 0;
         let mut bytes = 0;
         let mut last_progress = Instant::now();
+        let mut supports_small_batch = true;
         let mut changes = heads
             .iter()
             .filter(|(_, version)| version.blob.is_none())
-            .chain(heads.iter().filter(|(_, version)| version.blob.is_some()))
+            .chain(
+                heads
+                    .iter()
+                    .filter(|(path, version)| can_pack(path, version)),
+            )
+            .chain(
+                heads
+                    .iter()
+                    .filter(|(path, version)| version.blob.is_some() && !can_pack(path, version)),
+            )
             .filter(|(path, _)| !ignored(path, false))
             .peekable();
         let mut skipped = Vec::new();
         while changes.peek().is_some() {
-            let mut batch = Vec::with_capacity(DOWNLOAD_WINDOW);
+            let mut batch = Vec::with_capacity(SMALL_BATCH);
             let mut hashes = BTreeSet::new();
-            while batch.len() < DOWNLOAD_WINDOW {
+            let mut streamed = 0;
+            let mut packed_count = 0;
+            while batch.len() < SMALL_BATCH {
                 let Some(&(path, version)) = changes.peek() else {
                     break;
                 };
                 let download = should_download(path, version, &tracking);
+                let small = download && supports_small_batch && can_pack(path, version);
+                if download && !small && (streamed == DOWNLOAD_WINDOW || packed_count > 0) {
+                    break;
+                }
                 // The temporary file is shared by all paths with the same content.
                 if download
                     && let Some(blob) = &version.blob
@@ -219,11 +250,74 @@ impl Job<'_> {
                 {
                     break;
                 }
+                if small {
+                    packed_count += 1;
+                } else if download {
+                    streamed += 1;
+                }
                 changes.next();
-                batch.push((path, version, download));
+                batch.push((path, version, download, small));
             }
-            let incoming = join_all(batch.iter().map(|&(path, version, download)| {
+            let small_files = batch
+                .iter()
+                .filter(|entry| entry.3)
+                .map(|&(path, version, _, _)| (path.as_str(), version))
+                .collect::<Vec<_>>();
+            let mut packed = BTreeMap::new();
+            if !small_files.is_empty() {
+                let started = Instant::now();
+                let response = self
+                    .client
+                    .call(
+                        Request::ReadSmall {
+                            share: self.share.to_owned(),
+                            files: small_files
+                                .iter()
+                                .map(|(path, version)| ((*path).to_owned(), version.id))
+                                .collect(),
+                        },
+                        &[],
+                    )
+                    .await;
+                match response {
+                    Ok((Answer::SmallFiles(lengths), bytes)) => {
+                        ensure!(
+                            lengths.len() == small_files.len(),
+                            "unexpected file count in batch"
+                        );
+                        let mut rest = bytes.as_slice();
+                        for ((path, version), length) in small_files.iter().zip(lengths) {
+                            ensure!(
+                                version.blob.as_ref().map(|blob| blob.size) == Some(length as u64),
+                                "unexpected file size in batch"
+                            );
+                            let (data, next) = rest
+                                .split_at_checked(length)
+                                .context("truncated file batch")?;
+                            packed.insert(*path, data.to_vec());
+                            rest = next;
+                        }
+                        ensure!(rest.is_empty(), "unexpected trailing data in file batch");
+                        if started.elapsed() >= Duration::from_secs(2) {
+                            eprintln!(
+                                "{}: received {} small files in {:.1}s",
+                                self.share,
+                                packed.len(),
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                    Ok(_) => bail!("expected small file batch"),
+                    Err(error) if error.to_string().starts_with("unknown variant `ReadSmall`") => {
+                        supports_small_batch = false;
+                        eprintln!("{}: host uses single-file requests", self.share);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let incoming = stream::iter(batch.iter().map(|&(path, version, download, _)| {
                 let directory = &download_directory;
+                let download = download && !packed.contains_key(path.as_str());
                 async move {
                     if download {
                         fetch(self.client, directory, self.share, path, version, true)
@@ -234,8 +328,10 @@ impl Job<'_> {
                     }
                 }
             }))
+            .buffered(DOWNLOAD_WINDOW)
+            .collect::<Vec<_>>()
             .await;
-            for ((path, version, _), partial) in batch.into_iter().zip(incoming) {
+            for ((path, version, _, _), partial) in batch.into_iter().zip(incoming) {
                 let prior = before.get(path);
                 if prior == version.blob.as_ref()
                     && tracking.get(path).is_some_and(|entry| {
@@ -263,13 +359,17 @@ impl Job<'_> {
                     }
                     match &version.blob {
                         Some(blob) => {
-                            let partial = partial?.context("missing downloaded file")?;
                             if local_blob(&self.root, path)? != actual {
                                 skipped.push(format!("{path} changed during download"));
                                 continue;
                             }
-                            install(&self.root, path, partial.verified()?, blob)?;
-                            partial.remove()?;
+                            if let Some(bytes) = packed.remove(path.as_str()) {
+                                install_bytes(&self.root, path, &bytes, blob)?;
+                            } else {
+                                let partial = partial?.context("missing downloaded file")?;
+                                install(&self.root, path, partial.verified()?, blob)?;
+                                partial.remove()?;
+                            }
                             completed += 1;
                             bytes += blob.size;
                             if completed == total

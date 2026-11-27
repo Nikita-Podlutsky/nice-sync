@@ -3,7 +3,7 @@ use crate::{
     language::{Applied, Mode, Network, Right, Rule, Share},
     published::{Edit, Heads, Location, Publication},
     store::{Blob, Version, lock_directory, validate_path, write_json},
-    transfer::{PartialFile, read_chunk},
+    transfer::{PartialFile, SMALL_BATCH, SMALL_FILE, read_chunk},
     wire,
 };
 use anyhow::{Context, Result, ensure};
@@ -49,6 +49,10 @@ pub enum Request {
     Manifest {
         share: String,
     },
+    ReadSmall {
+        share: String,
+        files: Vec<(String, u64)>,
+    },
     Prepare {
         share: String,
         path: String,
@@ -76,6 +80,7 @@ pub enum Answer {
     Names(Vec<String>),
     History(Vec<Version>),
     File(Version),
+    SmallFiles(Vec<usize>),
     Manifest(Heads),
     Offset(u64),
     Committed(String),
@@ -318,6 +323,7 @@ impl Server {
                     | Request::Chunk { .. }
                     | Request::Commit { .. }
                     | Request::Read { sync: true, .. }
+                    | Request::ReadSmall { .. }
             )
         {
             ensure!(
@@ -462,6 +468,35 @@ impl Server {
                     Answer::File(version.clone()),
                     read_chunk(&publication.store.object(blob)?, offset, blob.size)?,
                 )
+            }
+            Request::ReadSmall { share, files } => {
+                ensure!(
+                    !files.is_empty() && files.len() <= SMALL_BATCH,
+                    "invalid small-file batch size"
+                );
+                let (definition, rule) = self.rule(&device, &share)?;
+                ensure!(
+                    rule.mode.downloads(),
+                    "share is upload-only for this device"
+                );
+                let publication = self
+                    .publications
+                    .get(&share)
+                    .context("unknown publication")?;
+                let mut lengths = Vec::with_capacity(files.len());
+                let mut bytes = Vec::new();
+                for (path, revision) in files {
+                    ensure!(
+                        !self.network.ignored(definition, Some(rule), &path, false),
+                        "file is excluded from synchronization"
+                    );
+                    let version = publication.store.version(&path, Some(revision))?;
+                    let blob = version.blob.as_ref().context("revision is a deletion")?;
+                    ensure!(blob.size <= SMALL_FILE, "file exceeds the small-file limit");
+                    lengths.push(blob.size as usize);
+                    bytes.extend(read_chunk(&publication.store.object(blob)?, 0, blob.size)?);
+                }
+                (Answer::SmallFiles(lengths), bytes)
             }
             Request::Manifest { share } => {
                 let (_, rule) = self.rule(&device, &share)?;

@@ -315,6 +315,19 @@ pub fn copy_verified(source: &Path, destination: &Path, blob: &Blob) -> Result<(
     persist(temporary, destination)
 }
 
+pub fn write_verified(bytes: &[u8], destination: &Path, blob: &Blob) -> Result<()> {
+    ensure!(
+        &fingerprint(&mut io::Cursor::new(bytes))? == blob,
+        "size or hash mismatch"
+    );
+    let directory = destination
+        .parent()
+        .context("file must have a parent directory")?;
+    let mut temporary = NamedTempFile::new_in(directory)?;
+    std::io::Write::write_all(&mut temporary, bytes)?;
+    persist(temporary, destination)
+}
+
 pub fn ensure_portable_catalog(catalog: &Catalog, path: &str) -> Result<()> {
     let folded = path.to_lowercase();
     for other in catalog.keys() {

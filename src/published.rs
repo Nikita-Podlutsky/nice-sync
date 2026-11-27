@@ -1,6 +1,6 @@
 use crate::store::{
     Blob, Catalog, Store, Version, copy_verified, ensure_portable_catalog, fingerprint, is_link,
-    local_path, push_version, read_json, scan, validate_path, write_json,
+    local_path, push_version, read_json, scan, validate_path, write_json, write_verified,
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -316,6 +316,14 @@ pub fn local_blob(root: &Path, name: &str) -> Result<Option<Blob>> {
 }
 
 pub fn install(root: &Path, name: &str, source: &Path, blob: &Blob) -> Result<()> {
+    copy_verified(source, &install_destination(root, name)?, blob)
+}
+
+pub fn install_bytes(root: &Path, name: &str, bytes: &[u8], blob: &Blob) -> Result<()> {
+    write_verified(bytes, &install_destination(root, name)?, blob)
+}
+
+fn install_destination(root: &Path, name: &str) -> Result<PathBuf> {
     let destination = local_path(root, name)?;
     let parent = destination
         .parent()
@@ -324,7 +332,7 @@ pub fn install(root: &Path, name: &str, source: &Path, blob: &Blob) -> Result<()
     if destination.is_dir() {
         fs::remove_dir(&destination).context("destination directory is not empty")?;
     }
-    copy_verified(source, &destination, blob)
+    Ok(destination)
 }
 
 pub fn remove(root: &Path, name: &str) -> Result<()> {

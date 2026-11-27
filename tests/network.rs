@@ -135,7 +135,7 @@ impl Fixture {
 fn join_uses_host_policy_and_follows_updates() -> Result<()> {
     let fixture = Fixture::new(SAMPLE)?;
     fixture.write("server-files/docs/notes.txt", "from the host")?;
-    for number in 0..12 {
+    for number in 0..80 {
         fixture.write(
             &format!("server-files/docs/item-{number:02}.txt"),
             format!("item {number}"),
@@ -149,7 +149,7 @@ fn join_uses_host_policy_and_follows_updates() -> Result<()> {
     fixture.run("laptop", &["join", "--sync", invitation.trim()])?;
     assert!(!fixture.path("state-laptop/applied.json").exists());
     fixture.assert_contents("laptop-files/docs/notes.txt", "from the host")?;
-    for number in 0..12 {
+    for number in 0..80 {
         fixture.assert_contents(
             &format!("laptop-files/docs/item-{number:02}.txt"),
             &format!("item {number}"),

@@ -7,6 +7,8 @@ use std::{
 };
 
 pub const CHUNK: usize = 1024 * 1024;
+pub const SMALL_FILE: u64 = 16 * 1024;
+pub const SMALL_BATCH: usize = CHUNK / SMALL_FILE as usize;
 
 pub struct PartialFile {
     blob: Blob,
