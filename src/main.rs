@@ -104,6 +104,9 @@ enum Command {
     },
     /// Exchange files for the local device according to the applied policy.
     Sync {
+        /// Read this local configuration before each synchronization pass.
+        #[arg(long, conflicts_with = "follow_config")]
+        config: Option<PathBuf>,
         /// Use relay for discovery only and transfer files over a direct connection.
         #[arg(long)]
         p2p_only: bool,
@@ -292,7 +295,7 @@ async fn run() -> Result<()> {
                 member.destination.network, member.device, member.destination.host
             );
             if sync {
-                sync_once(&client, &state, &member, true, None).await?;
+                sync_once(&client, &state, &member, true, None, None).await?;
             }
             client.close().await;
         }
@@ -345,6 +348,7 @@ async fn run() -> Result<()> {
             println!("Saved {}", destination.display());
         }
         Command::Sync {
+            config,
             share,
             every,
             follow_config,
@@ -372,8 +376,15 @@ async fn run() -> Result<()> {
                         Client::connect(&state, &destination).await?
                     };
                     let route = show_route.then(|| client.trace_route());
-                    let result =
-                        sync_once(&client, &state, &member, follow_config, share.as_deref()).await;
+                    let result = sync_once(
+                        &client,
+                        &state,
+                        &member,
+                        follow_config,
+                        config.as_deref(),
+                        share.as_deref(),
+                    )
+                    .await;
                     if let Some(route) = route {
                         route.abort();
                     }
@@ -505,6 +516,7 @@ async fn sync_once(
     state: &std::path::Path,
     member: &Membership,
     follow_config: bool,
+    config: Option<&Path>,
     share: Option<&str>,
 ) -> Result<()> {
     let local = if follow_config {
@@ -518,19 +530,64 @@ async fn sync_once(
             device: member.device.clone(),
             file: None,
         }
+    } else if let Some(config) = config {
+        Applied::read(config, member.device.clone())?
     } else {
         Applied::load(state)?
     };
     let network = local.network()?;
     member.check(&network, &local.device)?;
     if follow_config {
-        use std::io::Write;
-        let mut snapshot = tempfile::NamedTempFile::new_in(state)?;
-        snapshot.write_all(local.source.as_bytes())?;
-        snapshot.as_file().sync_all()?;
-        snapshot.persist(state.join("shared.sync"))?;
+        save_host_snapshot(state, &local.source)?;
     }
     sync::sync(client, state, &local, &network, share).await
+}
+
+fn save_host_snapshot(state: &Path, source: &str) -> Result<()> {
+    let shared = state.join("shared.sync");
+    let baseline = state.join("shared-baseline.json");
+    let previous: Option<String> = read_json(&baseline)?;
+    let current = read_optional_text(&shared)?;
+    let hash = |text: &str| blake3::hash(text.as_bytes()).to_hex().to_string();
+    let prior_matches = current
+        .as_deref()
+        .is_some_and(|text| previous.as_deref() == Some(hash(text).as_str()));
+    if current.as_deref().is_some_and(|text| text != source) && !prior_matches {
+        let host = state.join("host.sync");
+        if read_optional_text(&host)?.as_deref() != Some(source) {
+            save_config_text(state, &host, source)?;
+            eprintln!(
+                "Local edits kept in {}. Host configuration saved in {}.",
+                shared.display(),
+                host.display()
+            );
+        }
+        return Ok(());
+    }
+    if current.as_deref() != Some(source) {
+        save_config_text(state, &shared, source)?;
+    }
+    let digest = hash(source);
+    if previous.as_deref() != Some(&digest) {
+        write_json(&baseline, &digest)?;
+    }
+    Ok(())
+}
+
+fn read_optional_text(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_config_text(state: &Path, path: &Path, source: &str) -> Result<()> {
+    let mut snapshot = tempfile::NamedTempFile::new_in(state)?;
+    snapshot.write_all(source.as_bytes())?;
+    snapshot.as_file().sync_all()?;
+    snapshot.persist(path)?;
+    Ok(())
 }
 
 fn remote_path<'a>(host: &str, input: &'a str) -> Result<(Option<&'a str>, &'a str)> {

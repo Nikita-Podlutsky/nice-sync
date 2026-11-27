@@ -803,6 +803,68 @@ fn browse_reads_only_the_current_directory_without_creating_versions() -> Result
     Ok(())
 }
 
+#[test]
+fn client_keeps_edits_and_reloads_an_explicit_local_file() -> Result<()> {
+    let fixture = Fixture::new(SAMPLE)?;
+    fixture.write("server-files/docs/notes.txt", "remote notes")?;
+    let _host = fixture.listen("127.0.0.1:0", true)?;
+    fixture.join("laptop")?;
+    fs::create_dir_all(fixture.path("laptop-files/docs"))?;
+    fixture.run("laptop", &["sync", "--follow-config", "--share", "docs"])?;
+    let shared = fixture.path("state-laptop/shared.sync");
+    let edited = SAMPLE.replace("\"laptop-files/docs\"", "\"../my-docs\"");
+    fs::write(&shared, &edited)?;
+    fixture.run("laptop", &["sync", "--follow-config", "--share", "docs"])?;
+    assert_eq!(fs::read_to_string(&shared)?, edited);
+    fixture.assert_contents("state-laptop/host.sync", SAMPLE)?;
+
+    fs::create_dir_all(fixture.path("my-docs"))?;
+    fs::create_dir_all(fixture.path("next-docs"))?;
+    let mut sync = Host(
+        fixture
+            .command("laptop")
+            .args([
+                "sync",
+                "--config",
+                shared.to_str().context("UTF-8 path")?,
+                "--share",
+                "docs",
+                "--every",
+                "1",
+            ])
+            .stdout(Stdio::null())
+            .spawn()?,
+    );
+    for (path, source) in [
+        ("my-docs/notes.txt", None),
+        (
+            "next-docs/notes.txt",
+            Some(edited.replace("\"../my-docs\"", "\"../next-docs\"")),
+        ),
+    ] {
+        if let Some(source) = &source {
+            fs::write(&shared, source)?;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !fixture.path(path).is_file() {
+            ensure!(
+                sync.0.try_wait()?.is_none(),
+                "sync exited before reading the local configuration"
+            );
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "local rule did not take effect: {path}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        fixture.assert_contents(path, "remote notes")?;
+        if let Some(source) = source {
+            assert_eq!(fs::read_to_string(&shared)?, source);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn published_symlinks_are_never_followed() -> Result<()> {
