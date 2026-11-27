@@ -8,7 +8,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use futures_util::StreamExt;
-use iroh::{Endpoint, EndpointId, endpoint::Connection};
+use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr, endpoint::Connection};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -105,6 +105,52 @@ impl Client {
         };
         let endpoint = wire::bind(access::key(state)?, direct).await?;
         let connection = wire::connect(&endpoint, destination.endpoint.clone()).await?;
+        Ok(Self {
+            endpoint,
+            connection,
+        })
+    }
+
+    pub async fn connect_p2p(state: &Path, destination: &Destination) -> Result<Self> {
+        if destination.direct {
+            return Self::connect(state, destination).await;
+        }
+        let discovery = Self::connect(state, destination).await?;
+        let mut paths = discovery.connection.paths_stream();
+        let next_direct = async {
+            let mut waiting = false;
+            while let Some(snapshot) = paths.next().await {
+                for path in snapshot.iter().filter(|path| path.is_selected()) {
+                    if let TransportAddr::Ip(address) = path.remote_addr() {
+                        return Some(*address);
+                    }
+                }
+                if !waiting {
+                    eprintln!("Waiting for a direct P2P path");
+                    waiting = true;
+                }
+            }
+            None
+        };
+        let address = tokio::time::timeout(Duration::from_secs(20), next_direct).await;
+        drop(paths);
+        let local_sockets = discovery.endpoint.bound_sockets();
+        discovery.close().await;
+        let address = address
+            .context("no direct P2P path after 20 seconds")?
+            .context("connection closed before a direct P2P path was established")?;
+        let local = local_sockets
+            .into_iter()
+            .find(|socket| socket.is_ipv4() == address.is_ipv4())
+            .context("no local UDP socket for the direct P2P path")?;
+        let endpoint = wire::bind(access::key(state)?, Some(local))
+            .await
+            .context("reopening the local UDP socket for P2P transfer")?;
+        let direct = EndpointAddr::new(destination.endpoint.id).with_ip_addr(address);
+        let connection = wire::connect(&endpoint, direct)
+            .await
+            .context("the discovered P2P path did not survive direct reconnect")?;
+        eprintln!("P2P-only transfer via {address}");
         Ok(Self {
             endpoint,
             connection,

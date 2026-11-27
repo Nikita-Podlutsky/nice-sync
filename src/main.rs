@@ -102,6 +102,9 @@ enum Command {
     },
     /// Exchange files for the local device according to the applied policy.
     Sync {
+        /// Use relay for discovery only and transfer files over a direct connection.
+        #[arg(long)]
+        p2p_only: bool,
         /// Connect directly to this IP and UDP port using the registered host key.
         #[arg(long)]
         direct: Option<SocketAddr>,
@@ -361,6 +364,7 @@ async fn run() -> Result<()> {
             follow_config,
             direct,
             show_route,
+            p2p_only,
         } => {
             let _lock = lock_directory(&state.join("runtime"))?;
             let member = Membership::load(&state)?;
@@ -376,7 +380,11 @@ async fn run() -> Result<()> {
             }
             loop {
                 let result = async {
-                    let client = Client::connect(&state, &destination).await?;
+                    let client = if p2p_only {
+                        Client::connect_p2p(&state, &destination).await?
+                    } else {
+                        Client::connect(&state, &destination).await?
+                    };
                     let route = show_route.then(|| client.trace_route());
                     let result =
                         sync_once(&client, &state, &member, follow_config, share.as_deref()).await;

@@ -300,6 +300,40 @@ fn directs_sync_to_an_explicit_socket_without_changing_registration() -> Result<
     Ok(())
 }
 
+#[test]
+fn p2p_sync_reconnects_after_discovery_and_preserves_membership() -> Result<()> {
+    let fixture = Fixture::new(SAMPLE)?;
+    fixture.write("server-files/docs/notes.txt", "downloaded peer to peer")?;
+    fs::create_dir_all(fixture.path("laptop-files/docs"))?;
+    let _host = fixture.listen("127.0.0.1:0", true)?;
+    fixture.join("laptop")?;
+    let state = fixture.path("state-laptop");
+    let mut member = access::Membership::load(&state)?;
+    member.destination.direct = false;
+    let file = state.join("joined.json");
+    nice_sync::store::write_json(&file, &member)?;
+    let stored = fs::read(&file)?;
+
+    let result = fixture
+        .command("laptop")
+        .args([
+            "sync",
+            "--follow-config",
+            "--share",
+            "docs",
+            "--p2p-only",
+            "--show-route",
+        ])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    success(result, "sync using discovered P2P path")?;
+    assert!(stderr.contains("P2P-only transfer via 127.0.0.1:"));
+    assert!(stderr.contains("Nice Sync route: ip:127.0.0.1:"));
+    fixture.assert_contents("laptop-files/docs/notes.txt", "downloaded peer to peer")?;
+    assert_eq!(fs::read(file)?, stored);
+    Ok(())
+}
+
 fn success(output: Output, operation: &str) -> Result<String> {
     ensure!(
         output.status.success(),

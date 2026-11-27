@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    printf '%s\n' 'Usage: bash scripts/connect-linux.sh [--state DIRECTORY] [--once] [--show-route] [--direct IP:PORT]'
+    printf '%s\n' 'Usage: bash scripts/connect-linux.sh [--state DIRECTORY] [--once] [--show-route] [--p2p-only] [--direct IP:PORT]'
 }
 
 client_home="${NICE_SYNC_HOME:-$HOME}"
@@ -31,8 +31,8 @@ while (($#)); do
             route_args+=(--direct "$2")
             shift 2
             ;;
-        --show-route)
-            route_args+=(--show-route)
+        --show-route|--p2p-only)
+            route_args+=("$1")
             shift
             ;;
         -h|--help)
