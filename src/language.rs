@@ -512,6 +512,7 @@ pub fn parse(source: &str) -> Result<Network> {
     let (network_at, name) = parser.name()?;
     parser.symbol('{')?;
     let mut devices = BTreeSet::new();
+    let mut configured_host = None;
     let mut shares = Vec::new();
     let mut filters = Vec::new();
     let mut permits = Vec::new();
@@ -523,6 +524,12 @@ pub fn parse(source: &str) -> Result<Network> {
                 let (at, name) = parser.name()?;
                 if !devices.insert(name.clone()) {
                     return Err(at.semantic(format!("duplicate device '{name}'")));
+                }
+            }
+            "host" => {
+                let host = parser.name()?;
+                if configured_host.replace(host).is_some() {
+                    return Err(at.semantic("duplicate network host"));
                 }
             }
             "share" => {
@@ -548,7 +555,10 @@ pub fn parse(source: &str) -> Result<Network> {
             Ok(())
         }
     };
-    let mut host = None;
+    if let Some(host) = &configured_host {
+        known_device(host)?;
+    }
+    let mut host = configured_host.map(|(_, name)| name);
     let mut registered_shares = BTreeMap::new();
     for ((at, name), share) in shares {
         known_device(&share.host)?;
@@ -582,7 +592,8 @@ pub fn parse(source: &str) -> Result<Network> {
             return Err(at.semantic(format!("duplicate share '{name}'")));
         }
     }
-    let host = host.ok_or_else(|| network_at.semantic("network needs at least one share"))?;
+    let host = host
+        .ok_or_else(|| network_at.semantic("declare 'host DEVICE' in a network without shares"))?;
     let mut registered_permits = BTreeMap::new();
     for (device, grant) in permits {
         known_device(&device)?;

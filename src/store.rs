@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{self, Seek, SeekFrom},
+    io::{self, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
 };
 use tempfile::NamedTempFile;
@@ -55,13 +55,23 @@ pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 }
 
 pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let mut temporary = temporary_at(path)?;
+    serde_json::to_writer(&mut temporary, value)?;
+    persist(temporary, path)
+}
+
+pub fn write_text(path: &Path, source: &str) -> Result<()> {
+    let mut temporary = temporary_at(path)?;
+    temporary.write_all(source.as_bytes())?;
+    persist(temporary, path)
+}
+
+fn temporary_at(path: &Path) -> Result<NamedTempFile> {
     let directory = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let mut temporary = NamedTempFile::new_in(directory)?;
-    serde_json::to_writer(&mut temporary, value)?;
-    persist(temporary, path)
+    Ok(NamedTempFile::new_in(directory)?)
 }
 
 fn persist(temporary: NamedTempFile, path: &Path) -> Result<()> {

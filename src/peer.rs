@@ -2,7 +2,7 @@ use crate::{
     access::{self, Destination, Device},
     language::{Applied, Mode, Network, Right, Rule, Share},
     published::{Change, Edit, Heads, Location, Publication},
-    store::{Blob, Version, lock_directory, validate_path, write_json, write_verified},
+    store::{Blob, Version, lock_directory, validate_path, write_json, write_text, write_verified},
     transfer::{
         PACK_BYTES, PACK_ENTRIES, PartialFile, SMALL_BATCH, SMALL_FILE, read_chunk, read_range,
     },
@@ -24,6 +24,10 @@ use std::{
 #[derive(Deserialize, Serialize)]
 pub enum Request {
     SharedConfig,
+    PublishConfig {
+        expected: String,
+        source: String,
+    },
     BulkIndex {
         share: String,
     },
@@ -247,6 +251,7 @@ impl Client {
 
 pub struct Server {
     share_config: bool,
+    config_editor: Option<EndpointId>,
     state: PathBuf,
     applied: Applied,
     config_hash: blake3::Hash,
@@ -260,6 +265,7 @@ impl Server {
         state: &Path,
         direct: Option<SocketAddr>,
         share_config: bool,
+        config_editor: Option<&str>,
     ) -> Result<(Self, Endpoint)> {
         let applied = Applied::load(state)?;
         let network = applied.network()?;
@@ -268,6 +274,19 @@ impl Server {
             "serve must run on '{}'",
             network.host
         );
+        let config_editor = config_editor
+            .map(|name| {
+                ensure!(
+                    share_config && applied.file.is_some(),
+                    "apply a source file and enable --share-config before granting edit access"
+                );
+                ensure!(
+                    network.devices.contains(name),
+                    "unknown configuration editor '{name}'"
+                );
+                access::registered_id(state, name)
+            })
+            .transpose()?;
         println!("Opening publications for '{}'", network.name);
         let publications = publication_locations(state, &applied, &network)?
             .into_iter()
@@ -304,6 +323,7 @@ impl Server {
         Ok((
             Self {
                 share_config,
+                config_editor,
                 state: state.to_owned(),
                 config_hash: blake3::hash(applied.source.as_bytes()),
                 applied,
@@ -317,6 +337,10 @@ impl Server {
 
     fn reload(&mut self, path: &Path) -> Result<bool> {
         let source = fs::read_to_string(path)?;
+        self.apply_source(path, source, None)
+    }
+
+    fn apply_source(&mut self, path: &Path, source: String, editor: Option<&str>) -> Result<bool> {
         if source == self.applied.source {
             return Ok(false);
         }
@@ -331,8 +355,15 @@ impl Server {
             network.host == self.network.host && network.name == self.network.name,
             "a live update must use the same network and host"
         );
+        if let Some(editor) = editor {
+            ensure!(
+                network.devices.contains(editor),
+                "the update removes the configuration editor"
+            );
+        }
 
         let mut added = BTreeMap::new();
+        let mut unchanged_roots = Vec::new();
         for (name, location) in publication_locations(&self.state, &candidate, &network)? {
             if self
                 .publications
@@ -340,11 +371,23 @@ impl Server {
                 .is_none_or(|existing| existing.location.root != location.root)
             {
                 added.insert(name, Publication::open(location)?);
+            } else {
+                unchanged_roots.push((name, location));
             }
+        }
+        if editor.is_some() {
+            ensure!(
+                fs::read_to_string(path)? == self.applied.source,
+                "host configuration changed; wait for reload and retry"
+            );
+            write_text(path, &candidate.source)?;
         }
         candidate.save(&self.state)?;
         self.publications
             .retain(|name, _| network.shares.contains_key(name));
+        for (name, location) in unchanged_roots {
+            self.publications.get_mut(&name).unwrap().location = location;
+        }
         self.publications.extend(added);
         self.config_hash = blake3::hash(candidate.source.as_bytes());
         self.applied = candidate;
@@ -393,11 +436,21 @@ impl Server {
                 access::enroll(&self.state, peer, &token, &device, access::epoch_seconds()?)?;
             return Ok((Answer::Enrolled(registered.name), Vec::new()));
         }
-        let device = access::registered(&self.state, peer)?;
+        let mut device = access::registered(&self.state, peer)?;
         ensure!(
             self.network.devices.contains(&device.name),
             "device has been removed from the network"
         );
+        let can_edit = self.config_editor == Some(peer);
+        if can_edit {
+            for (name, share) in &self.network.shares {
+                let rights = device.grants.entry(name.clone()).or_default();
+                rights.extend([Right::Browse, Right::Download]);
+                if let Some(rule) = share.rules.get(&device.name) {
+                    rights.insert(rule.mode.right());
+                }
+            }
+        }
         let empty = Vec::new();
         Ok(match request {
             Request::BulkIndex { share } => {
@@ -542,6 +595,26 @@ impl Server {
                     self.share_config,
                     "host has not enabled shared configuration"
                 );
+                *sync_config = Some(self.config_hash);
+                (Answer::SharedConfig(self.applied.source.clone()), empty)
+            }
+            Request::PublishConfig { expected, source } => {
+                ensure!(
+                    can_edit,
+                    "device has no permission to publish configuration"
+                );
+                ensure!(
+                    self.config_hash.to_hex().as_str() == expected,
+                    "shared configuration changed; retry with the latest version"
+                );
+                let path = self
+                    .applied
+                    .file
+                    .clone()
+                    .context("no configuration source file")?;
+                if self.apply_source(&path, source, Some(&device.name))? {
+                    println!("Reloaded {} from '{}'", path.display(), device.name);
+                }
                 *sync_config = Some(self.config_hash);
                 (Answer::SharedConfig(self.applied.source.clone()), empty)
             }
@@ -875,9 +948,14 @@ fn require(device: &Device, share: &str, right: Right) -> Result<()> {
     Ok(())
 }
 
-pub async fn serve(state: &Path, direct: Option<SocketAddr>, share_config: bool) -> Result<()> {
+pub async fn serve(
+    state: &Path,
+    direct: Option<SocketAddr>,
+    share_config: bool,
+    config_editor: Option<&str>,
+) -> Result<()> {
     let _lock = lock_directory(&state.join("runtime"))?;
-    let (server, endpoint) = Server::listen(state, direct, share_config).await?;
+    let (server, endpoint) = Server::listen(state, direct, share_config, config_editor).await?;
     println!("Serving '{}' as {}", server.network.name, endpoint.id());
     let source = server.applied.file.clone().filter(|_| share_config);
     if share_config && source.is_none() {

@@ -238,6 +238,15 @@ pub fn registered(state: &Path, peer: EndpointId) -> Result<Device> {
         .context("device is not registered")
 }
 
+pub fn registered_id(state: &Path, name: &str) -> Result<EndpointId> {
+    let registry: Registry = read_json(&state.join("access/registry.json"))?;
+    registry
+        .devices
+        .into_iter()
+        .find_map(|(id, device)| (device.name == name).then_some(id))
+        .with_context(|| format!("configuration editor '{name}' is not registered"))
+}
+
 pub fn revoke(state: &Path, device: &str) -> Result<()> {
     let directory = state.join("access");
     let _lock = lock_directory(&directory)?;

@@ -27,7 +27,18 @@ pub(crate) struct Location {
 
 impl Location {
     pub(crate) fn prepare(state: &Path, name: &str, path: &Path) -> Result<Self> {
-        fs::create_dir_all(path)?;
+        let state = state.canonicalize()?;
+        let base = state.join("shares").join(name);
+        let path_id = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
+        let reset = base.join(format!("recreate-{path_id}.json"));
+        if let Err(error) = fs::symlink_metadata(path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+            fs::create_dir_all(&base)?;
+            write_json(&reset, &true)?;
+            fs::create_dir_all(path)?;
+        }
         let metadata = fs::symlink_metadata(path)?;
         ensure!(
             metadata.is_dir() && !is_link(&metadata),
@@ -35,15 +46,18 @@ impl Location {
             path.display()
         );
         let root = path.canonicalize()?;
-        let state = state.canonicalize()?;
         ensure!(
             !root.starts_with(&state) && !state.starts_with(&root),
             "publication root and Nice Sync state overlap"
         );
-        let base = state.join("shares").join(name);
         let root_id = blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex();
         let directory = archive_directory(&base, root_id.as_str())?;
         let projection_file = directory.join(format!("projection-{root_id}.json"));
+        if reset.try_exists()? {
+            fs::create_dir_all(&directory)?;
+            write_json(&projection_file, &BTreeMap::<String, Blob>::new())?;
+            fs::remove_file(reset)?;
+        }
         let projection = read_json(&projection_file)?;
         Ok(Self {
             root,
@@ -157,6 +171,7 @@ impl Publication {
     }
 
     pub fn refresh(&mut self, host: &str, ignored: impl Fn(&str, bool) -> bool) -> Result<()> {
+        self.ensure_root()?;
         let files = scan(&self.location.root, &ignored)?;
         let names = files
             .keys()
@@ -179,6 +194,7 @@ impl Publication {
     }
 
     pub fn refresh_one(&mut self, name: &str, host: &str) -> Result<()> {
+        self.ensure_root()?;
         let actual = local_blob(&self.location.root, name)?;
         self.refresh_paths(host, [Ok((name, actual))])
     }
@@ -257,6 +273,7 @@ impl Publication {
         host: &str,
         mirror: bool,
     ) -> Result<Vec<String>> {
+        self.ensure_root()?;
         let root = self.location.root.clone();
         self.refresh_paths(
             host,
@@ -343,6 +360,23 @@ impl Publication {
             Some(blob) => install(&self.location.root, name, &self.store.object(blob)?, blob),
             None => remove(&self.location.root, name),
         }
+    }
+
+    fn ensure_root(&mut self) -> Result<()> {
+        let root = &self.location.root;
+        match fs::symlink_metadata(root) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && !is_link(&metadata),
+                "unsafe publication root: {}",
+                root.display()
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.save_projection(BTreeMap::new())?;
+                fs::create_dir_all(&self.location.root)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 
     fn save_projection(&mut self, projection: BTreeMap<String, Blob>) -> Result<()> {

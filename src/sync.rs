@@ -1,5 +1,5 @@
 use crate::{
-    language::{Applied, Mode, Network},
+    language::{Applied, Mode, Network, Share},
     peer::{Answer, Client, Request},
     published::{install, install_bytes, local_blob, remove},
     store::{Blob, Version, copy_verified, fingerprint, is_link, read_json, scan, write_json},
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -33,14 +34,24 @@ pub async fn sync(
     network: &Network,
     only: Option<&str>,
 ) -> Result<()> {
-    let mut shares = Vec::new();
+    let mut shares: Vec<(&String, &Share, PathBuf, PathBuf)> = Vec::new();
     for (name, share) in &network.shares {
         if only.is_some_and(|only| only != name) {
             continue;
         }
         if let Some(rule) = share.rules.get(&applied.device) {
             let configured = applied.base.join(&rule.path);
-            if rule.mode == Mode::Checkout {
+            let id = blake3::hash(configured.as_os_str().as_encoded_bytes()).to_hex();
+            let directory = state.join("sync").join(name);
+            let reset = directory.join(format!("recreate-{id}.json"));
+            if let Err(error) = fs::symlink_metadata(&configured) {
+                ensure!(
+                    error.kind() == io::ErrorKind::NotFound,
+                    "opening local folder {}: {error}",
+                    configured.display()
+                );
+                fs::create_dir_all(&directory)?;
+                write_json(&reset, &true)?;
                 fs::create_dir_all(&configured)?;
             }
             let metadata = fs::symlink_metadata(&configured)
@@ -59,22 +70,20 @@ pub async fn sync(
             ensure!(
                 !shares
                     .iter()
-                    .any(|(_, _, other): &(_, _, PathBuf)| root.starts_with(other)
-                        || other.starts_with(&root)),
+                    .any(|(_, _, other, _)| root.starts_with(other) || other.starts_with(&root)),
                 "local share roots overlap"
             );
-            shares.push((name, share, root));
+            shares.push((name, share, root, reset));
         }
     }
     if let Some(name) = only {
         ensure!(
-            shares.iter().any(|(candidate, _, _)| *candidate == name),
+            shares.iter().any(|(candidate, _, _, _)| *candidate == name),
             "no sync rule for '{name}'"
         );
     }
-    ensure!(!shares.is_empty(), "the local device has no sync rules");
     let mut failures = Vec::new();
-    for (name, share, root) in shares {
+    for (name, share, root, reset) in shares {
         let rule = &share.rules[&applied.device];
         let ignored = |path: &str, directory| network.ignored(share, Some(rule), path, directory);
         let mut location = blake3::Hasher::new();
@@ -91,6 +100,16 @@ pub async fn sync(
             mode: rule.mode,
             propagate: rule.propagate_delete,
         };
+        if reset.try_exists()? {
+            fs::create_dir_all(&job.directory)?;
+            write_json(&job.directory.join("tracking.json"), &Tracking::new())?;
+            match fs::remove_file(job.directory.join("pending.json")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            fs::remove_file(reset)?;
+        }
         match job.run(ignored).await {
             Ok(count) => println!("{name}: {count} changes"),
             Err(error) => failures.push(format!("{name}: {error:#}")),

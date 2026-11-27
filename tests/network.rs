@@ -85,11 +85,23 @@ impl Fixture {
     }
 
     fn listen(&self, address: &str, share_config: bool) -> Result<Host> {
+        self.listen_with_editor(address, share_config, None)
+    }
+
+    fn listen_with_editor(
+        &self,
+        address: &str,
+        share_config: bool,
+        editor: Option<&str>,
+    ) -> Result<Host> {
         self.apply("server")?;
         let mut command = self.command("server");
         command.args(["serve", "--direct", address]);
         if share_config {
             command.arg("--share-config");
+        }
+        if let Some(editor) = editor {
+            command.args(["--config-editor", editor]);
         }
         let mut host = Host(command.stdout(Stdio::null()).spawn()?);
         for _ in 0..250 {
@@ -129,6 +141,102 @@ impl Fixture {
         assert_eq!(fs::read_to_string(self.path(name))?, expected, "{name}");
         Ok(())
     }
+}
+
+#[test]
+fn registered_editor_publishes_additions_moves_and_removals() -> Result<()> {
+    let fixture = Fixture::new(SAMPLE)?;
+    let initial = fixture.listen("127.0.0.1:0", true)?;
+    let code = Code::read(&fixture.join("laptop")?)?;
+    fixture.join("phone")?;
+    let address = code
+        .destination
+        .endpoint
+        .ip_addrs()
+        .next()
+        .context("missing address")?;
+    drop(initial);
+    fs::remove_file(fixture.path("state-server/listener.json"))?;
+    let mut host = fixture.listen_with_editor(&address.to_string(), true, Some("laptop"))?;
+
+    let editor = ["sync", "--publish-config", "editor.sync"];
+    fixture.run("laptop", &editor)?;
+    fixture.assert_contents("editor.sync", SAMPLE)?;
+    fixture.write("phone.sync", format!("{SAMPLE}\n# from phone"))?;
+    fixture.failure(
+        "phone",
+        &["sync", "--publish-config", "phone.sync"],
+        "no permission",
+    )?;
+    fixture.assert_contents("network.sync", SAMPLE)?;
+
+    let added = SAMPLE.replacen(
+        "    share docs {",
+        "    share work {\n        host server at \"server-files/Работа над собой\"\n        mirror laptop at \"laptop-files/Работа над собой\" on delete propagate on conflict keep-both\n    }\n\n    share docs {",
+        1,
+    );
+    fixture.write("editor.sync", &added)?;
+    fixture.run("laptop", &editor)?;
+    fixture.assert_contents("network.sync", &added)?;
+    assert!(fixture.path("server-files/Работа над собой").is_dir());
+    assert!(fixture.path("laptop-files/Работа над собой").is_dir());
+    fixture.write("server-files/Работа над собой/notes.txt", "host file")?;
+    fixture.run("laptop", &editor)?;
+    fixture.assert_contents("laptop-files/Работа над собой/notes.txt", "host file")?;
+
+    fs::remove_dir_all(fixture.path("laptop-files/Работа над собой"))?;
+    fixture.run("laptop", &editor)?;
+    fixture.assert_contents("server-files/Работа над собой/notes.txt", "host file")?;
+    fixture.assert_contents("laptop-files/Работа над собой/notes.txt", "host file")?;
+    fs::remove_dir_all(fixture.path("server-files/Работа над собой"))?;
+    fixture.run("laptop", &editor)?;
+    fixture.assert_contents("server-files/Работа над собой/notes.txt", "host file")?;
+
+    let moved = added.replace("laptop-files/Работа над собой", "laptop-files/Работа");
+    fixture.write("editor.sync", &moved)?;
+    fixture.run("laptop", &editor)?;
+    fixture.assert_contents("laptop-files/Работа/notes.txt", "host file")?;
+    fixture.assert_contents("laptop-files/Работа над собой/notes.txt", "host file")?;
+
+    let edited_on_host = format!("{moved}\n# host edit");
+    fixture.write("network.sync", &edited_on_host)?;
+    wait_for_config(&fixture, &mut host, &edited_on_host)?;
+    let edited_on_client = format!("{moved}\n# client edit");
+    fixture.write("editor.sync", &edited_on_client)?;
+    fixture.failure("laptop", &editor, "changed on both devices")?;
+    fixture.assert_contents("editor.sync", &edited_on_client)?;
+    fixture.assert_contents("state-laptop/host.sync", &edited_on_host)?;
+    fixture.write("editor.sync", &edited_on_host)?;
+    fixture.run("laptop", &editor)?;
+
+    let empty = "network home { device server device laptop device phone host server }";
+    fixture.write("editor.sync", empty)?;
+    fixture.run("laptop", &editor)?;
+    fixture.run("phone", &["sync", "--follow-config"])?;
+    fixture.assert_contents("state-phone/shared.sync", empty)?;
+    fixture.assert_contents("network.sync", empty)?;
+    fixture.assert_contents("server-files/Работа над собой/notes.txt", "host file")?;
+    fixture.assert_contents("laptop-files/Работа/notes.txt", "host file")?;
+
+    let mut running_editor = Host(
+        fixture
+            .command("laptop")
+            .args(editor)
+            .args(["--every", "1"])
+            .stdout(Stdio::null())
+            .spawn()?,
+    );
+    let first_edit = format!("{empty}\n# first live edit");
+    fixture.write("editor.sync", &first_edit)?;
+    wait_for_config(&fixture, &mut host, &first_edit)?;
+    fixture.write("editor.sync", &added)?;
+    wait_for_config(&fixture, &mut host, &added)?;
+    ensure!(
+        running_editor.0.try_wait()?.is_none(),
+        "editor exited during live changes"
+    );
+    ensure!(host.0.try_wait()?.is_none(), "host restarted");
+    Ok(())
 }
 
 #[test]

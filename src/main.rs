@@ -4,7 +4,7 @@ use nice_sync::{
     access::{self, Code, Destination, Membership},
     language::{self, Applied},
     peer::{self, Answer, Client, Request},
-    store::{Store, lock_directory, read_json, validate_path, write_json},
+    store::{Store, lock_directory, read_json, validate_path, write_json, write_text},
     sync,
 };
 use std::{
@@ -59,6 +59,9 @@ enum Command {
         /// Publish the applied network.sync to registered devices.
         #[arg(long)]
         share_config: bool,
+        /// Allow this already registered device to publish shared configuration.
+        #[arg(long, requires = "share_config")]
+        config_editor: Option<String>,
         /// Listen on this existing LAN, VPN or loopback address without Iroh discovery.
         #[arg(long)]
         direct: Option<SocketAddr>,
@@ -107,6 +110,9 @@ enum Command {
         /// Read this local configuration before each synchronization pass.
         #[arg(long, conflicts_with = "follow_config")]
         config: Option<PathBuf>,
+        /// Edit this shared configuration locally and publish changes before each pass.
+        #[arg(long, conflicts_with_all = ["config", "follow_config"])]
+        publish_config: Option<PathBuf>,
         /// Use relay for discovery only and transfer files over a direct connection.
         #[arg(long)]
         p2p_only: bool,
@@ -199,7 +205,8 @@ async fn run() -> Result<()> {
         Command::Serve {
             direct,
             share_config,
-        } => peer::serve(&state, direct, share_config).await?,
+            config_editor,
+        } => peer::serve(&state, direct, share_config, config_editor.as_deref()).await?,
         Command::Invite {
             device,
             template,
@@ -295,7 +302,7 @@ async fn run() -> Result<()> {
                 member.destination.network, member.device, member.destination.host
             );
             if sync {
-                sync_once(&client, &state, &member, true, None, None).await?;
+                sync_once(&client, &state, &member, SyncConfig::Follow, None).await?;
             }
             client.close().await;
         }
@@ -349,6 +356,7 @@ async fn run() -> Result<()> {
         }
         Command::Sync {
             config,
+            publish_config,
             share,
             every,
             follow_config,
@@ -368,6 +376,15 @@ async fn run() -> Result<()> {
                     iroh::EndpointAddr::new(destination.endpoint.id).with_ip_addr(address);
                 destination.direct = true;
             }
+            let config = if let Some(path) = publish_config.as_deref() {
+                SyncConfig::Editor(path)
+            } else if let Some(path) = config.as_deref() {
+                SyncConfig::Local(path)
+            } else if follow_config {
+                SyncConfig::Follow
+            } else {
+                SyncConfig::Applied
+            };
             loop {
                 let result = async {
                     let client = if p2p_only {
@@ -376,15 +393,8 @@ async fn run() -> Result<()> {
                         Client::connect(&state, &destination).await?
                     };
                     let route = show_route.then(|| client.trace_route());
-                    let result = sync_once(
-                        &client,
-                        &state,
-                        &member,
-                        follow_config,
-                        config.as_deref(),
-                        share.as_deref(),
-                    )
-                    .await;
+                    let result =
+                        sync_once(&client, &state, &member, config, share.as_deref()).await;
                     if let Some(route) = route {
                         route.abort();
                     }
@@ -511,36 +521,117 @@ fn browse_path(host: &str, current: &str, input: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+#[derive(Clone, Copy)]
+enum SyncConfig<'a> {
+    Applied,
+    Follow,
+    Local(&'a Path),
+    Editor(&'a Path),
+}
+
 async fn sync_once(
     client: &Client,
     state: &std::path::Path,
     member: &Membership,
-    follow_config: bool,
-    config: Option<&Path>,
+    config: SyncConfig<'_>,
     share: Option<&str>,
 ) -> Result<()> {
-    let local = if follow_config {
-        let (answer, _) = client.call(Request::SharedConfig, &[]).await?;
-        let Answer::SharedConfig(source) = answer else {
-            bail!("expected shared configuration")
-        };
-        Applied {
-            source,
+    let local = match config {
+        SyncConfig::Follow => Applied {
+            source: shared_config(client, Request::SharedConfig).await?,
             base: std::env::current_dir()?,
             device: member.device.clone(),
             file: None,
-        }
-    } else if let Some(config) = config {
-        Applied::read(config, member.device.clone())?
-    } else {
-        Applied::load(state)?
+        },
+        SyncConfig::Local(path) => Applied::read(path, member.device.clone())?,
+        SyncConfig::Editor(path) => edit_config(client, state, member, path).await?,
+        SyncConfig::Applied => Applied::load(state)?,
     };
     let network = local.network()?;
     member.check(&network, &local.device)?;
-    if follow_config {
+    if matches!(config, SyncConfig::Follow) {
         save_host_snapshot(state, &local.source)?;
     }
     sync::sync(client, state, &local, &network, share).await
+}
+
+async fn shared_config(client: &Client, request: Request) -> Result<String> {
+    let (answer, _) = client.call(request, &[]).await?;
+    match answer {
+        Answer::SharedConfig(source) => Ok(source),
+        _ => bail!("expected shared configuration"),
+    }
+}
+
+async fn edit_config(
+    client: &Client,
+    state: &Path,
+    member: &Membership,
+    path: &Path,
+) -> Result<Applied> {
+    let path = std::path::absolute(path)?;
+    let parent = path
+        .parent()
+        .context("configuration file needs a parent directory")?;
+    fs::create_dir_all(parent)?;
+    let base = parent.canonicalize()?;
+    let path = base.join(path.file_name().context("expected a configuration file")?);
+    let id = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
+    let baseline = state.join(format!("editor-{id}.json"));
+    let mut previous: Option<String> = read_json(&baseline)?;
+    if previous.is_none() && path == state.canonicalize()?.join("shared.sync") {
+        previous = read_json(&state.join("shared-baseline.json"))?;
+    }
+    let remote = shared_config(client, Request::SharedConfig).await?;
+    let current = read_optional_text(&path)?;
+    let mut applied = Applied {
+        source: remote,
+        base,
+        device: member.device.clone(),
+        file: None,
+    };
+    member.check(&applied.network()?, &applied.device)?;
+    let expected = config_digest(&applied.source);
+    match current.as_deref() {
+        Some(local) if local == applied.source => {}
+        Some(local) if previous.as_deref() != Some(config_digest(local).as_str()) => {
+            if previous.as_deref().is_some_and(|hash| hash != expected) {
+                let snapshot = state.join("host.sync");
+                write_text(&snapshot, &applied.source)?;
+                bail!(
+                    "configuration changed on both devices; merge {} into {}",
+                    snapshot.display(),
+                    path.display()
+                );
+            }
+            let published = shared_config(
+                client,
+                Request::PublishConfig {
+                    expected,
+                    source: local.to_owned(),
+                },
+            )
+            .await?;
+            applied.source = published;
+            println!("Published {}", path.display());
+        }
+        _ => {
+            ensure!(
+                read_optional_text(&path)? == current,
+                "configuration changed while reading; retry sync"
+            );
+            write_text(&path, &applied.source)?;
+        }
+    }
+    let digest = config_digest(&applied.source);
+    if read_json::<Option<String>>(&baseline)?.as_ref() != Some(&digest) {
+        write_json(&baseline, &digest)?;
+    }
+    Ok(applied)
+}
+
+fn config_digest(source: &str) -> String {
+    blake3::hash(source.as_bytes()).to_hex().to_string()
 }
 
 fn save_host_snapshot(state: &Path, source: &str) -> Result<()> {
@@ -548,10 +639,9 @@ fn save_host_snapshot(state: &Path, source: &str) -> Result<()> {
     let baseline = state.join("shared-baseline.json");
     let previous: Option<String> = read_json(&baseline)?;
     let current = read_optional_text(&shared)?;
-    let hash = |text: &str| blake3::hash(text.as_bytes()).to_hex().to_string();
     let prior_matches = current
         .as_deref()
-        .is_some_and(|text| previous.as_deref() == Some(hash(text).as_str()));
+        .is_some_and(|text| previous.as_deref() == Some(config_digest(text).as_str()));
     if current.as_deref().is_some_and(|text| text != source) && !prior_matches {
         let host = state.join("host.sync");
         if read_optional_text(&host)?.as_deref() != Some(source) {
@@ -567,7 +657,7 @@ fn save_host_snapshot(state: &Path, source: &str) -> Result<()> {
     if current.as_deref() != Some(source) {
         save_config_text(state, &shared, source)?;
     }
-    let digest = hash(source);
+    let digest = config_digest(source);
     if previous.as_deref() != Some(&digest) {
         write_json(&baseline, &digest)?;
     }
