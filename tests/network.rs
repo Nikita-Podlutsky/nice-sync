@@ -343,6 +343,51 @@ fn success(output: Output, operation: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
+#[test]
+fn bulk_sync_exchanges_multiple_packets_in_both_directions() -> Result<()> {
+    let fixture = Fixture::new(SAMPLE)?;
+    for number in 0..520 {
+        fixture.write(
+            &format!("server-files/docs/remote/{number}.txt"),
+            format!("remote {number}"),
+        )?;
+        fixture.write(
+            &format!("laptop-files/docs/local/{number}.txt"),
+            format!("local {number}"),
+        )?;
+    }
+    let large = vec![57; 9 * 1024 * 1024];
+    fixture.write("server-files/docs/remote.bin", &large)?;
+    fixture.write("laptop-files/docs/local.bin", &large)?;
+    let _host = fixture.listen("127.0.0.1:0", true)?;
+    fixture.join("laptop")?;
+    fixture.run("laptop", &["sync", "--follow-config", "--share", "docs"])?;
+    for number in 0..520 {
+        fixture.assert_contents(
+            &format!("laptop-files/docs/remote/{number}.txt"),
+            &format!("remote {number}"),
+        )?;
+        fixture.assert_contents(
+            &format!("server-files/docs/local/{number}.txt"),
+            &format!("local {number}"),
+        )?;
+    }
+    assert_eq!(
+        fs::read(fixture.path("laptop-files/docs/remote.bin"))?,
+        large
+    );
+    assert_eq!(
+        fs::read(fixture.path("server-files/docs/local.bin"))?,
+        large
+    );
+    assert!(
+        fixture
+            .run("laptop", &["sync", "--follow-config", "--share", "docs"])?
+            .contains("0 changes")
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn resumes_after_disconnect_and_rejects_invalid_or_reused_invitations() -> Result<()> {
     let fixture = Fixture::new(SAMPLE)?;
@@ -459,6 +504,53 @@ async fn resumes_after_disconnect_and_rejects_invalid_or_reused_invitations() ->
         ],
     )?;
     assert_eq!(fs::read(fixture.path("download.jpg"))?, data);
+    let bulk = vec![17; CHUNK + 129];
+    let bulk_blob = fingerprint(&mut bulk.as_slice())?;
+    let write = |offset: usize, length| Request::BulkWrite {
+        share: "image".into(),
+        parts: vec![nice_sync::peer::WritePart {
+            path: "bulk.jpg".into(),
+            blob: bulk_blob.clone(),
+            offset: offset as u64,
+            length,
+        }],
+    };
+    let changes = || {
+        vec![nice_sync::published::Change {
+            path: "bulk.jpg".into(),
+            base: None,
+            blob: Some(bulk_blob.clone()),
+        }]
+    };
+    client.call(write(0, CHUNK), &bulk[..CHUNK]).await?;
+    client.close().await;
+    let client = Client::connect(&state, &parsed.destination).await?;
+    let (answer, _) = client
+        .call(
+            Request::BulkPrepare {
+                share: "image".into(),
+                changes: changes(),
+            },
+            &[],
+        )
+        .await?;
+    assert!(matches!(answer, Answer::BulkOffsets(offsets) if offsets == [CHUNK as u64]));
+    client
+        .call(write(CHUNK, bulk.len() - CHUNK), &bulk[CHUNK..])
+        .await?;
+    client
+        .call(
+            Request::BulkCommit {
+                share: "image".into(),
+                changes: changes(),
+            },
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        fs::read(fixture.path("server-files/photos/bulk.jpg"))?,
+        bulk
+    );
     fixture.run("server", &["revoke", "phone"])?;
     assert!(client.call(Request::Roots, &[]).await.is_err());
     client.close().await;

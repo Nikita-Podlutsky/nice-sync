@@ -1,4 +1,4 @@
-use crate::transfer::CHUNK;
+use crate::transfer::PACK_BYTES;
 use anyhow::{Context, Result, ensure};
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey,
@@ -6,10 +6,10 @@ use iroh::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{net::SocketAddr, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 const ALPN: &[u8] = b"nice-sync/1";
-const REQUEST_LIMIT: usize = 64 * 1024;
+const REQUEST_LIMIT: usize = 4 * 1024 * 1024;
 const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 pub const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -71,17 +71,15 @@ pub async fn call<Q: Serialize, A: DeserializeOwned>(
     request: &Q,
     data: &[u8],
 ) -> Result<(A, Vec<u8>)> {
-    tokio::time::timeout(TIMEOUT, async {
-        let (mut send, mut receive) = connection.open_bi().await?;
-        send_packet(&mut send, serde_json::to_vec(request)?, data, REQUEST_LIMIT).await?;
-        let (reply, data) = read_packet(&mut receive, RESPONSE_LIMIT).await?;
-        match reply {
-            Reply::Success(value) => Ok((value, data)),
-            Reply::Error(error) => Err(anyhow::Error::msg(error)),
-        }
-    })
-    .await
-    .context("timed out waiting for the Nice Sync host to answer (120 seconds)")?
+    let (mut send, mut receive) = tokio::time::timeout(TIMEOUT, connection.open_bi())
+        .await
+        .context("timed out opening a Nice Sync stream")??;
+    send_packet(&mut send, serde_json::to_vec(request)?, data, REQUEST_LIMIT).await?;
+    let (reply, data) = read_packet(&mut receive, RESPONSE_LIMIT).await?;
+    match reply {
+        Reply::Success(value) => Ok((value, data)),
+        Reply::Error(error) => Err(anyhow::Error::msg(error)),
+    }
 }
 
 async fn send_packet(
@@ -91,13 +89,21 @@ async fn send_packet(
     limit: usize,
 ) -> Result<()> {
     ensure!(
-        header.len() <= limit && data.len() <= CHUNK,
+        header.len() <= limit && data.len() <= PACK_BYTES,
         "packet exceeds limit"
     );
-    send.write_u32(header.len() as u32).await?;
-    send.write_u32(data.len() as u32).await?;
-    send.write_all(&header).await?;
-    send.write_all(data).await?;
+    let mut prefix = [0; 8];
+    prefix[..4].copy_from_slice(&(header.len() as u32).to_be_bytes());
+    prefix[4..].copy_from_slice(&(data.len() as u32).to_be_bytes());
+    for mut bytes in [&prefix[..], &header, data] {
+        while !bytes.is_empty() {
+            let written = tokio::time::timeout(TIMEOUT, send.write(bytes))
+                .await
+                .context("no write progress for 120 seconds")??;
+            ensure!(written != 0, "stream stopped writing");
+            bytes = &bytes[written..];
+        }
+    }
     send.finish()?;
     Ok(())
 }
@@ -106,18 +112,35 @@ async fn read_packet<T: DeserializeOwned>(
     receive: &mut RecvStream,
     limit: usize,
 ) -> Result<(T, Vec<u8>)> {
-    let header_len = receive.read_u32().await? as usize;
-    let data_len = receive.read_u32().await? as usize;
+    let (header_len, data_len) = tokio::time::timeout(TIMEOUT, async {
+        Ok::<_, std::io::Error>((
+            receive.read_u32().await? as usize,
+            receive.read_u32().await? as usize,
+        ))
+    })
+    .await
+    .context("timed out waiting for the Nice Sync packet header")??;
     ensure!(
-        header_len <= limit && data_len <= CHUNK,
+        header_len <= limit && data_len <= PACK_BYTES,
         "packet exceeds limit"
     );
     let mut header = vec![0; header_len];
     let mut data = vec![0; data_len];
-    receive.read_exact(&mut header).await?;
-    receive.read_exact(&mut data).await?;
+    for mut bytes in [&mut header[..], &mut data[..]] {
+        while !bytes.is_empty() {
+            let length = tokio::time::timeout(TIMEOUT, receive.read(bytes))
+                .await
+                .context("no read progress for 120 seconds")??
+                .context("truncated packet")?;
+            ensure!(length != 0, "stream stopped reading");
+            bytes = &mut bytes[length..];
+        }
+    }
     ensure!(
-        receive.read(&mut [0]).await?.is_none(),
+        tokio::time::timeout(TIMEOUT, receive.read(&mut [0]))
+            .await
+            .context("timed out waiting for the end of the packet")??
+            .is_none(),
         "unexpected packet data"
     );
     Ok((serde_json::from_slice(&header)?, data))

@@ -5,6 +5,7 @@ use crate::{
     store::{Blob, Version, copy_verified, fingerprint, is_link, read_json, scan, write_json},
     transfer::{PartialFile, SMALL_BATCH, SMALL_FILE, read_chunk},
 };
+mod bulk;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use std::{
 
 const DOWNLOAD_WINDOW: usize = 8;
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct Tracked {
     local: Option<Blob>,
     remote: Option<u64>,
@@ -121,6 +122,27 @@ impl Job<'_> {
             .iter()
             .map(|(path, file)| Ok((path.clone(), fingerprint(&mut File::open(file)?)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        match self
+            .client
+            .call(
+                Request::BulkIndex {
+                    share: self.share.to_owned(),
+                },
+                &[],
+            )
+            .await
+        {
+            Ok((Answer::Manifest(heads), _)) => {
+                return self
+                    .run_bulk(files, before, tracking, heads, &ignored)
+                    .await;
+            }
+            Ok(_) => bail!("expected synchronization index"),
+            Err(error) if error.to_string().starts_with("unknown variant `BulkIndex`") => {
+                eprintln!("{}: host uses the previous transfer protocol", self.share);
+            }
+            Err(error) => return Err(error),
+        }
         let mut count = 0;
         if self.propagate {
             for (path, entry) in &tracking {

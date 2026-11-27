@@ -7,6 +7,8 @@ use std::{
 };
 
 pub const CHUNK: usize = 1024 * 1024;
+pub const PACK_BYTES: usize = 8 * 1024 * 1024;
+pub const PACK_ENTRIES: usize = 512;
 pub const SMALL_FILE: u64 = 16 * 1024;
 pub const SMALL_BATCH: usize = CHUNK / SMALL_FILE as usize;
 
@@ -44,7 +46,9 @@ impl PartialFile {
             "incorrect transfer offset, expected {length}"
         );
         ensure!(
-            !data.is_empty() && data.len() <= CHUNK && data.len() as u64 <= self.blob.size - offset,
+            !data.is_empty()
+                && data.len() <= PACK_BYTES
+                && data.len() as u64 <= self.blob.size - offset,
             "invalid chunk length"
         );
         let mut file = File::options()
@@ -86,9 +90,14 @@ impl PartialFile {
 
 pub fn read_chunk(source: &Path, offset: u64, size: u64) -> Result<Vec<u8>> {
     ensure!(offset <= size, "offset exceeds size");
+    read_range(source, offset, (size - offset).min(CHUNK as u64) as usize)
+}
+
+pub fn read_range(source: &Path, offset: u64, length: usize) -> Result<Vec<u8>> {
+    ensure!(length <= PACK_BYTES, "range exceeds packet size");
     let mut file = File::open(source)?;
     file.seek(SeekFrom::Start(offset))?;
-    let mut data = vec![0; (size - offset).min(CHUNK as u64) as usize];
+    let mut data = vec![0; length];
     file.read_exact(&mut data)?;
     Ok(data)
 }

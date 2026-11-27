@@ -1,9 +1,11 @@
 use crate::{
     access::{self, Destination, Device},
     language::{Applied, Mode, Network, Right, Rule, Share},
-    published::{Edit, Heads, Location, Publication},
-    store::{Blob, Version, lock_directory, validate_path, write_json},
-    transfer::{PartialFile, SMALL_BATCH, SMALL_FILE, read_chunk},
+    published::{Change, Edit, Heads, Location, Publication},
+    store::{Blob, Version, lock_directory, validate_path, write_json, write_verified},
+    transfer::{
+        PACK_BYTES, PACK_ENTRIES, PartialFile, SMALL_BATCH, SMALL_FILE, read_chunk, read_range,
+    },
     wire,
 };
 use anyhow::{Context, Result, ensure};
@@ -22,6 +24,28 @@ use std::{
 #[derive(Deserialize, Serialize)]
 pub enum Request {
     SharedConfig,
+    BulkIndex {
+        share: String,
+    },
+    BulkHeads {
+        share: String,
+    },
+    BulkRead {
+        share: String,
+        parts: Vec<ReadPart>,
+    },
+    BulkPrepare {
+        share: String,
+        changes: Vec<Change>,
+    },
+    BulkWrite {
+        share: String,
+        parts: Vec<WritePart>,
+    },
+    BulkCommit {
+        share: String,
+        changes: Vec<Change>,
+    },
     Enroll {
         token: [u8; 32],
         device: String,
@@ -73,6 +97,22 @@ pub enum Request {
 }
 
 #[derive(Deserialize, Serialize)]
+pub struct ReadPart {
+    pub path: String,
+    pub version: u64,
+    pub offset: u64,
+    pub length: usize,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct WritePart {
+    pub path: String,
+    pub blob: Blob,
+    pub offset: u64,
+    pub length: usize,
+}
+
+#[derive(Deserialize, Serialize)]
 pub enum Answer {
     SharedConfig(String),
     Enrolled(String),
@@ -84,6 +124,9 @@ pub enum Answer {
     Manifest(Heads),
     Offset(u64),
     Committed(String),
+    BulkOffsets(Vec<u64>),
+    BulkData,
+    BulkCommitted(Vec<String>),
 }
 
 pub struct Client {
@@ -312,13 +355,19 @@ impl Server {
         data: Vec<u8>,
         sync_config: &mut Option<blake3::Hash>,
     ) -> Result<(Answer, Vec<u8>)> {
-        if !matches!(request, Request::Chunk { .. }) {
+        if !matches!(request, Request::Chunk { .. } | Request::BulkWrite { .. }) {
             ensure!(data.is_empty(), "unexpected request body");
         }
         if let Some(hash) = sync_config
             && matches!(
                 request,
                 Request::Manifest { .. }
+                    | Request::BulkIndex { .. }
+                    | Request::BulkHeads { .. }
+                    | Request::BulkRead { .. }
+                    | Request::BulkPrepare { .. }
+                    | Request::BulkWrite { .. }
+                    | Request::BulkCommit { .. }
                     | Request::Prepare { .. }
                     | Request::Chunk { .. }
                     | Request::Commit { .. }
@@ -347,6 +396,143 @@ impl Server {
         );
         let empty = Vec::new();
         Ok(match request {
+            Request::BulkIndex { share } => {
+                let (_, rule) = self.rule(&device, &share)?;
+                let downloads = rule.mode.downloads();
+                let heads = self.index(&share, downloads, &device)?;
+                (Answer::Manifest(heads), empty)
+            }
+            Request::BulkHeads { share } => {
+                let (definition, rule) = self.rule(&device, &share)?;
+                ensure!(
+                    rule.mode.downloads(),
+                    "share is upload-only for this device"
+                );
+                let mut heads = self
+                    .publications
+                    .get(&share)
+                    .context("unknown publication")?
+                    .heads();
+                heads.retain(|path, _| !self.network.ignored(definition, Some(rule), path, false));
+                (Answer::Manifest(heads), empty)
+            }
+            Request::BulkRead { share, parts } => {
+                ensure!(
+                    !parts.is_empty() && parts.len() <= PACK_ENTRIES,
+                    "invalid download packet"
+                );
+                let (definition, rule) = self.rule(&device, &share)?;
+                ensure!(
+                    rule.mode.downloads(),
+                    "share is upload-only for this device"
+                );
+                let store = &self
+                    .publications
+                    .get(&share)
+                    .context("unknown publication")?
+                    .store;
+                let mut bytes = Vec::new();
+                for part in parts {
+                    ensure!(
+                        !self
+                            .network
+                            .ignored(definition, Some(rule), &part.path, false),
+                        "file is excluded from synchronization"
+                    );
+                    let blob = store
+                        .version(&part.path, Some(part.version))?
+                        .blob
+                        .as_ref()
+                        .context("revision is a deletion")?;
+                    ensure!(
+                        part.length <= PACK_BYTES - bytes.len()
+                            && part.offset <= blob.size
+                            && part.length as u64 <= blob.size - part.offset,
+                        "invalid download range"
+                    );
+                    bytes.extend(read_range(&store.object(blob)?, part.offset, part.length)?);
+                }
+                (Answer::BulkData, bytes)
+            }
+            Request::BulkPrepare { share, changes } => {
+                self.validate_bulk_changes(&device, &share, &changes)?;
+                let store = &self.publications[&share].store;
+                let offsets = changes
+                    .iter()
+                    .map(|change| {
+                        let Some(blob) = &change.blob else {
+                            return Ok(0);
+                        };
+                        if store.object(blob)?.is_file() {
+                            Ok(blob.size)
+                        } else {
+                            self.partial(peer, &share, blob)?.offset()
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (Answer::BulkOffsets(offsets), empty)
+            }
+            Request::BulkWrite { share, parts } => {
+                ensure!(
+                    !parts.is_empty() && parts.len() <= PACK_ENTRIES,
+                    "invalid upload packet"
+                );
+                let mut rest = data.as_slice();
+                for part in parts {
+                    self.upload_rule(&device, &share, &part.path)?;
+                    let (bytes, tail) = rest
+                        .split_at_checked(part.length)
+                        .context("truncated upload packet")?;
+                    rest = tail;
+                    ensure!(
+                        part.offset <= part.blob.size
+                            && part.length as u64 <= part.blob.size - part.offset,
+                        "invalid upload range"
+                    );
+                    let object = self.publications[&share].store.object(&part.blob)?;
+                    if !object.is_file() && part.offset == 0 && part.length as u64 == part.blob.size
+                    {
+                        write_verified(bytes, &object, &part.blob)?;
+                    } else if !object.is_file() {
+                        let partial = self.partial(peer, &share, &part.blob)?;
+                        let offset = partial.offset()?;
+                        if offset < part.offset + part.length as u64 {
+                            let remaining = offset
+                                .checked_sub(part.offset)
+                                .context("upload range starts after the saved offset")?;
+                            partial.append(offset, &bytes[remaining as usize..])?;
+                        }
+                    }
+                }
+                ensure!(rest.is_empty(), "unexpected upload bytes");
+                (Answer::BulkData, empty)
+            }
+            Request::BulkCommit { share, changes } => {
+                let mirror = self.validate_bulk_changes(&device, &share, &changes)?;
+                for change in &changes {
+                    if let Some(blob) = &change.blob {
+                        let partial = self.partial(peer, &share, blob)?;
+                        let store = &self.publications[&share].store;
+                        let object = store.object(blob)?;
+                        if !object.is_file() {
+                            ensure!(
+                                store.ingest(partial.verified()?)? == *blob,
+                                "uploaded file changed before commit"
+                            );
+                        }
+                        ensure!(
+                            object.metadata()?.len() == blob.size,
+                            "object size mismatch"
+                        );
+                        partial.remove()?;
+                    }
+                }
+                let host = self.applied.device.clone();
+                let paths =
+                    self.publication(&share)?
+                        .commit_many(&changes, &device.name, &host, mirror)?;
+                (Answer::BulkCommitted(paths), empty)
+            }
             Request::SharedConfig => {
                 ensure!(
                     self.share_config,
@@ -593,6 +779,52 @@ impl Server {
             .context("unknown publication")
     }
 
+    fn index(&mut self, share: &str, expose: bool, device: &Device) -> Result<Heads> {
+        let definition = self
+            .network
+            .shares
+            .get(share)
+            .context("unknown publication")?;
+        let publication = self
+            .publications
+            .get_mut(share)
+            .context("unknown publication")?;
+        publication.refresh(&self.applied.device, |path, directory| {
+            self.network.ignored(definition, None, path, directory)
+        })?;
+        if !expose {
+            return Ok(Heads::new());
+        }
+        let mut heads = publication.heads();
+        let (definition, rule) = self.rule(device, share)?;
+        heads.retain(|path, _| !self.network.ignored(definition, Some(rule), path, false));
+        Ok(heads)
+    }
+
+    fn validate_bulk_changes(
+        &self,
+        device: &Device,
+        share: &str,
+        changes: &[Change],
+    ) -> Result<bool> {
+        ensure!(
+            !changes.is_empty() && changes.len() <= PACK_ENTRIES,
+            "invalid number of upload changes"
+        );
+        let mut unique = std::collections::BTreeSet::new();
+        let mut mirror = false;
+        for change in changes {
+            let rule = self.upload_rule(device, share, &change.path)?;
+            ensure!(unique.insert(&change.path), "duplicate upload path");
+            ensure!(
+                change.blob.is_some() || rule.propagate_delete,
+                "delete is disabled for this device"
+            );
+            mirror = rule.mode == Mode::Mirror;
+        }
+        Ok(mirror)
+    }
+
     fn rule(&self, device: &Device, name: &str) -> Result<(&Share, &Rule)> {
         let share = self
             .network
@@ -750,10 +982,9 @@ async fn handle_connection(connection: Connection, server: Arc<Mutex<Server>>) -
         else {
             return Ok(());
         };
-        let invocation =
-            tokio::time::timeout(wire::TIMEOUT, wire::read_request(&mut receive)).await;
+        let invocation = wire::read_request(&mut receive).await;
         let result = match invocation {
-            Ok(Ok((request, data))) => {
+            Ok((request, data)) => {
                 let server = Arc::clone(&server);
                 let (result, current_config) = tokio::task::spawn_blocking(move || {
                     let result = server
@@ -768,9 +999,8 @@ async fn handle_connection(connection: Connection, server: Arc<Mutex<Server>>) -
                 sync_config = current_config;
                 result
             }
-            Ok(Err(error)) => Err(error),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(error),
         };
-        tokio::time::timeout(wire::TIMEOUT, wire::reply(&mut send, result)).await??;
+        wire::reply(&mut send, result).await?;
     }
 }

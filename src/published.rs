@@ -186,66 +186,102 @@ impl Publication {
             blob,
             mirror,
         } = edit;
-        validate_path(name)?;
-        self.refresh_one(name, host)?;
-        let current = self
-            .store
-            .catalog()
-            .get(name)
-            .and_then(|versions| versions.last());
-        let head = current.and_then(|version| version.blob.as_ref());
-        if blob.as_ref() == head {
-            return Ok(name.to_owned());
-        }
-        let current_id = current.map(|version| version.id);
-        let stale = mirror && base != current_id;
-        if let Some(base) = base {
-            self.store
-                .version(name, Some(base))
-                .context("unknown base revision")?;
-        }
-        if stale && blob.is_none() {
-            return Ok(name.to_owned());
-        }
-        let mut catalog = self.store.catalog().clone();
-        let target = match (stale, head, &blob) {
-            (true, Some(_), Some(blob)) => conflict_path(&catalog, name, blob)?,
-            _ => name.to_owned(),
-        };
-        let previous = if target == name {
-            head.cloned()
-        } else {
-            self.refresh_one(&target, host)?;
-            catalog = self.store.catalog().clone();
-            if let Ok(current) = self.store.version(&target, None) {
-                if current.blob == blob {
-                    return Ok(target);
-                }
-                anyhow::bail!("Conflict file {target} changed. Retry synchronization.");
-            }
-            None
-        };
-        ensure_portable_catalog(&catalog, &target)?;
-        let history = catalog.entry(target.clone()).or_default();
-        push_version(
-            history,
-            if mirror { base } else { current_id },
-            author,
-            blob.clone(),
-        );
-        if target != name {
-            history.last_mut().expect("new revision").base_path = Some(name.to_owned());
-        }
-        self.store.save(catalog)?;
-        self.project(&target, blob.as_ref(), previous.as_ref())?;
-        Ok(target)
+        Ok(self
+            .commit_many(
+                &[Change {
+                    path: name.to_owned(),
+                    base,
+                    blob,
+                }],
+                author,
+                host,
+                mirror,
+            )?
+            .remove(0))
     }
 
-    fn project(&mut self, name: &str, blob: Option<&Blob>, previous: Option<&Blob>) -> Result<()> {
-        self.project_file(name, blob, previous)?;
-        let mut projection = self.location.projection.clone();
-        update_projection(&mut projection, name, blob.cloned());
-        self.save_projection(projection)
+    pub fn commit_many(
+        &mut self,
+        changes: &[Change],
+        author: &str,
+        host: &str,
+        mirror: bool,
+    ) -> Result<Vec<String>> {
+        let root = self.location.root.clone();
+        self.refresh_paths(
+            host,
+            changes
+                .iter()
+                .map(|change| Ok((change.path.as_str(), local_blob(&root, &change.path)?))),
+        )?;
+        let mut catalog = Cow::Borrowed(self.store.catalog());
+        let mut results = Vec::with_capacity(changes.len());
+        let mut projections = Vec::new();
+        for Change { path, base, blob } in changes {
+            let current = catalog.get(path).and_then(|versions| versions.last());
+            let head = current.and_then(|version| version.blob.as_ref());
+            let current_id = current.map(|version| version.id);
+            if blob.as_ref() == head {
+                results.push(path.clone());
+                continue;
+            }
+            if let Some(base) = base {
+                ensure!(
+                    catalog
+                        .get(path)
+                        .is_some_and(|versions| versions.iter().any(|v| v.id == *base)),
+                    "unknown base revision"
+                );
+            }
+            let stale = mirror && *base != current_id;
+            if stale && blob.is_none() {
+                results.push(path.clone());
+                continue;
+            }
+            let target = match (stale, head, blob) {
+                (true, Some(_), Some(blob)) => conflict_path(&catalog, path, blob)?,
+                _ => path.clone(),
+            };
+            let previous = if target == *path {
+                head.cloned()
+            } else if catalog
+                .get(&target)
+                .and_then(|versions| versions.last())
+                .is_some_and(|version| version.blob == *blob)
+            {
+                results.push(target);
+                continue;
+            } else {
+                ensure!(
+                    local_blob(&root, &target)?.is_none(),
+                    "conflict file already exists: {target}"
+                );
+                None
+            };
+            ensure_portable_catalog(&catalog, &target)?;
+            let history = catalog.to_mut().entry(target.clone()).or_default();
+            push_version(
+                history,
+                if mirror { *base } else { current_id },
+                author,
+                blob.clone(),
+            );
+            if target != *path {
+                history.last_mut().expect("new revision").base_path = Some(path.clone());
+            }
+            projections.push((target.clone(), blob.clone(), previous));
+            results.push(target);
+        }
+        if let Cow::Owned(catalog) = catalog {
+            self.store.save(catalog)?;
+            let mut projection = self.location.projection.clone();
+            for (target, blob, previous) in projections {
+                self.project_file(&target, blob.as_ref(), previous.as_ref())?;
+                update_projection(&mut projection, &target, blob);
+            }
+            self.save_projection(projection)?;
+        }
+        Ok(results)
     }
 
     fn project_file(&self, name: &str, blob: Option<&Blob>, previous: Option<&Blob>) -> Result<()> {
@@ -281,6 +317,13 @@ pub struct Edit<'a> {
     pub host: &'a str,
     pub blob: Option<Blob>,
     pub mirror: bool,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct Change {
+    pub path: String,
+    pub base: Option<u64>,
+    pub blob: Option<Blob>,
 }
 
 pub fn local_blob(root: &Path, name: &str) -> Result<Option<Blob>> {
