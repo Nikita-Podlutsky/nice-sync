@@ -9,9 +9,9 @@ use nice_sync::{
 };
 use std::{
     fs,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -91,6 +91,8 @@ enum Command {
     Revoke { device: String },
     /// List available publications or files in a published directory.
     Ls { path: Option<String> },
+    /// Browse published folders interactively with cd, ls and pwd.
+    Browse { path: Option<String> },
     /// Read the revision history for a published file.
     History { path: String },
     /// Download the current or a selected revision.
@@ -305,27 +307,11 @@ async fn run() -> Result<()> {
         }
         Command::Ls { path } => {
             let member = Membership::load(&state)?;
-            let location = path
-                .as_deref()
-                .map(|path| remote_path(&member.destination.host, path))
-                .transpose()?;
-            let request = match location {
-                Some((Some(share), directory)) => Request::List {
-                    share: share.to_owned(),
-                    directory: directory.to_owned(),
-                },
-                _ => Request::Roots,
-            };
             let client = Client::connect(&state, &member.destination).await?;
-            let (answer, _) = client.call(request, &[]).await?;
-            let Answer::Names(names) = answer else {
-                bail!("expected directory listing")
-            };
-            for name in names {
-                println!("{name}");
-            }
+            list_remote(&client, &member.destination.host, path.as_deref()).await?;
             client.close().await;
         }
+        Command::Browse { path } => browse(&state, path.as_deref()).await?,
         Command::History { path } => {
             let member = Membership::load(&state)?;
             let (share, path) = remote_file(&member.destination.host, &path)?;
@@ -404,6 +390,114 @@ async fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn list_remote(client: &Client, host: &str, path: Option<&str>) -> Result<()> {
+    let request = match path.map(|path| remote_path(host, path)).transpose()? {
+        Some((Some(share), directory)) => Request::List {
+            share: share.to_owned(),
+            directory: directory.to_owned(),
+        },
+        _ => Request::Roots,
+    };
+    let (answer, _) = client.call(request, &[]).await?;
+    let Answer::Names(names) = answer else {
+        bail!("expected directory listing")
+    };
+    for name in names {
+        println!("{name}");
+    }
+    Ok(())
+}
+
+async fn browse(state: &Path, start: Option<&str>) -> Result<()> {
+    let member = Membership::load(state)?;
+    let host = &member.destination.host;
+    let mut current = browse_path(host, "", start.unwrap_or("/"))?;
+    let mut client = Client::connect(state, &member.destination).await?;
+    list_remote(&client, host, Some(&format!("{host}:/{current}"))).await?;
+    let stdin = io::stdin();
+    let terminal = stdin.is_terminal();
+    loop {
+        if terminal {
+            print!("{host}:/{current}> ");
+            io::stdout().flush()?;
+        }
+        let mut input = String::new();
+        if stdin.read_line(&mut input)? == 0 {
+            break;
+        }
+        let input = input.trim();
+        let (command, argument) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+        let argument = argument.trim();
+        match command {
+            "exit" | "quit" => break,
+            "" => continue,
+            "pwd" => println!("{host}:/{current}"),
+            "help" => println!("ls [directory]   cd [directory]   pwd   exit"),
+            "ls" | "cd" => {
+                let result = async {
+                    let next = if command == "ls" && argument.is_empty() {
+                        current.clone()
+                    } else {
+                        browse_path(host, &current, argument)?
+                    };
+                    if client.is_closed() {
+                        client = Client::connect(state, &member.destination).await?;
+                    }
+                    list_remote(&client, host, Some(&format!("{host}:/{next}"))).await?;
+                    if command == "cd" {
+                        current = next;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    eprintln!("{error:#}");
+                }
+            }
+            _ => eprintln!("Unknown browse command. Type help."),
+        }
+    }
+    client.close().await;
+    Ok(())
+}
+
+fn browse_path(host: &str, current: &str, input: &str) -> Result<String> {
+    let input = input
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            input
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(input);
+    let (base, path) = if let Some((device, path)) = input.split_once(":/") {
+        ensure!(device == host, "expected the host name '{host}'");
+        ("", path)
+    } else if input.is_empty() || input.starts_with('/') {
+        ("", input)
+    } else {
+        (current, input)
+    };
+    let mut parts = base
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => {
+                validate_path(part)?;
+                parts.push(part);
+            }
+        }
+    }
+    Ok(parts.join("/"))
 }
 
 async fn sync_once(

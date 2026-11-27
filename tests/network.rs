@@ -236,6 +236,7 @@ fn changing_root_at_start_keeps_the_legacy_archive_separate() -> Result<()> {
         fixture.run("laptop", &["ls", "server:/docs"])?.trim(),
         "old.txt"
     );
+    fixture.run("laptop", &["history", "server:/docs/old.txt"])?;
     drop(host);
     fs::remove_file(fixture.path("state-server/listener.json"))?;
     fs::remove_file(fixture.path("state-server/shares/docs/primary-root.json"))?;
@@ -248,6 +249,7 @@ fn changing_root_at_start_keeps_the_legacy_archive_separate() -> Result<()> {
         fixture.run("laptop", &["ls", "server:/docs"])?.trim(),
         "lesson.txt"
     );
+    fixture.run("laptop", &["history", "server:/docs/lesson.txt"])?;
     assert!(!fixture.path("server-files/Учеба/old.txt").exists());
     fixture.assert_contents("server-files/docs/old.txt", "legacy archive")?;
     let legacy = fs::read_to_string(fixture.path("state-server/shares/docs/catalog.json"))?;
@@ -731,7 +733,7 @@ fn delegated_invitations_only_grant_the_template_permissions() -> Result<()> {
         fixture.run("laptop", &["ls", "server:/docs"])?.trim(),
         "readme.txt"
     );
-    assert!(!fs::read_to_string(&catalog)?.contains(".venv"));
+    assert!(!catalog.exists());
     fixture.run(
         "laptop",
         &["get", "server:/docs/.venv/cache.txt", "cache.txt"],
@@ -740,6 +742,64 @@ fn delegated_invitations_only_grant_the_template_permissions() -> Result<()> {
     fixture.run("laptop", &["get", "server:/docs/readme.txt", "joined.txt"])?;
     fixture.assert_contents("joined.txt", "readable with an invitation")?;
     fixture.failure("laptop", &["ls", "server:/projects"], "permission denied")?;
+    Ok(())
+}
+
+#[test]
+fn browse_reads_only_the_current_directory_without_creating_versions() -> Result<()> {
+    let source = SAMPLE.replace(
+        "    invitation docs-laptop",
+        r#"
+    share files { host server at "storage" }
+    permit laptop browse on files
+    invitation docs-laptop"#,
+    );
+    let fixture = Fixture::new(&source)?;
+    fixture.write(
+        "storage/Учебные файлы/nested/private.txt",
+        "visible only at the requested level",
+    )?;
+    fixture.write("storage/Учебные файлы/notes.txt", "not downloaded")?;
+    fs::create_dir_all(fixture.path("storage/empty"))?;
+    let _host = fixture.host()?;
+    fixture.join("laptop")?;
+    assert!(
+        fixture
+            .run("laptop", &["ls", "server:/files/empty"])?
+            .is_empty()
+    );
+    let mut child = fixture
+        .command("laptop")
+        .args(["browse", "server:/files"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    writeln!(
+        child.stdin.take().context("missing stdin")?,
+        "cd Учебные файлы\npwd\ncd nowhere\npwd\ncd nested\ncd ..\ncd /\ncd /unpublished\npwd\nexit"
+    )?;
+    let output = child.wait_with_output()?;
+    let errors = String::from_utf8_lossy(&output.stderr).into_owned();
+    let listings = success(output, "interactive browse")?;
+    assert_eq!(listings.matches("server:/files/Учебные файлы\n").count(), 2);
+    assert!(listings.contains("nested/\nnotes.txt\n"));
+    assert_eq!(listings.matches("private.txt\n").count(), 1);
+    assert!(listings.ends_with("server:/\n"));
+    assert!(
+        errors.contains("directory not found") && errors.contains("permission denied"),
+        "{errors}"
+    );
+    fixture.failure(
+        "laptop",
+        &["get", "server:/files/Учебные файлы/notes.txt", "out"],
+        "permission denied",
+    )?;
+    assert!(
+        !fixture
+            .path("state-server/shares/files/catalog.json")
+            .exists()
+    );
     Ok(())
 }
 
@@ -756,6 +816,7 @@ fn published_symlinks_are_never_followed() -> Result<()> {
     let _host = fixture.host()?;
     fixture.join("phone")?;
     assert!(fixture.run("phone", &["ls", "server:/image"])?.is_empty());
+    fixture.failure("phone", &["ls", "server:/image/link"], "refusing link")?;
     fixture.failure(
         "phone",
         &["get", "server:/image/link/private", "escaped"],

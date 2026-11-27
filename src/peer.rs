@@ -209,6 +209,10 @@ impl Client {
         wire::call(&self.connection, &request, data).await
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
+
     pub fn trace_route(&self) -> tokio::task::JoinHandle<()> {
         let connection = self.connection.clone();
         let mut last = None;
@@ -567,10 +571,6 @@ impl Server {
             }
             Request::List { share, directory } => {
                 require(&device, &share, Right::Browse)?;
-                if !directory.is_empty() {
-                    validate_path(&directory)?;
-                }
-                let host = self.applied.device.clone();
                 let definition = self
                     .network
                     .shares
@@ -578,39 +578,11 @@ impl Server {
                     .context("unknown publication")?;
                 let publication = self
                     .publications
-                    .get_mut(&share)
+                    .get(&share)
                     .context("unknown publication")?;
-                publication.refresh(&host, |path, directory| {
-                    self.network.ignored(definition, None, path, directory)
+                let names = publication.list_directory(&directory, |path, is_directory| {
+                    self.network.ignored(definition, None, path, is_directory)
                 })?;
-                let prefix = if directory.is_empty() {
-                    String::new()
-                } else {
-                    format!("{directory}/")
-                };
-                let mut names = BTreeMap::new();
-                for (path, entry) in publication.heads() {
-                    if entry.blob.is_some()
-                        && let Some(child) = path.strip_prefix(&prefix)
-                    {
-                        match child.split_once('/') {
-                            Some((first, _)) => {
-                                names.insert(first.to_owned(), true);
-                            }
-                            None => {
-                                names.insert(child.to_owned(), false);
-                            }
-                        }
-                    }
-                }
-                ensure!(
-                    directory.is_empty() || !names.is_empty(),
-                    "directory not found"
-                );
-                let names = names
-                    .into_iter()
-                    .map(|(name, dir)| if dir { format!("{name}/") } else { name })
-                    .collect();
                 (Answer::Names(names), empty)
             }
             Request::History { share, path } => {

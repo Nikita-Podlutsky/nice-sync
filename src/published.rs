@@ -89,6 +89,56 @@ fn archive_directory(base: &Path, root_id: &str) -> Result<PathBuf> {
 }
 
 impl Publication {
+    pub fn list_directory(
+        &self,
+        directory: &str,
+        ignored: impl Fn(&str, bool) -> bool,
+    ) -> Result<Vec<String>> {
+        let root = &self.location.root;
+        let target = if directory.is_empty() {
+            root.clone()
+        } else {
+            ensure!(!ignored(directory, true), "directory not found");
+            local_path(root, directory)?
+        };
+        let metadata = fs::symlink_metadata(&target).context("directory not found")?;
+        ensure!(
+            metadata.is_dir() && !is_link(&metadata),
+            "expected a directory"
+        );
+        let target = target.canonicalize()?;
+        ensure!(
+            target.starts_with(root),
+            "directory is outside the publication"
+        );
+        let mut names = Vec::new();
+        for entry in fs::read_dir(target)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let path = if directory.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{directory}/{name}")
+            };
+            if validate_path(&path).is_err() {
+                continue;
+            }
+            let meta = fs::symlink_metadata(entry.path())?;
+            if is_link(&meta) || !(meta.is_dir() || meta.is_file()) || ignored(&path, meta.is_dir())
+            {
+                continue;
+            }
+            names.push(if meta.is_dir() {
+                format!("{name}/")
+            } else {
+                name.to_owned()
+            });
+        }
+        names.sort_unstable();
+        Ok(names)
+    }
+
     pub(crate) fn open(location: Location) -> Result<Self> {
         let store = Store::open(&location.directory)?;
         Ok(Self { store, location })

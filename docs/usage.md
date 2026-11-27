@@ -21,11 +21,11 @@ Windows публикует папку, Arch хранит её зеркало. С
 
 ## Запуск Windows
 
-Если хост уже работает, пользуйся им. Для ручного запуска после остановки текущая сборка находится в `target/windows-bulk/nice-sync.exe`:
+Если хост уже работает, пользуйся им. Для ручного запуска после остановки текущая сборка находится в `target/windows-browse/nice-sync.exe`:
 
 ```powershell
 $repo = 'C:/Users/pniki/Documents/Programs/Rust/nice_sync'
-$app = "$repo/target/windows-bulk/nice-sync.exe"
+$app = "$repo/target/windows-browse/nice-sync.exe"
 $state = 'C:/configs/nice-sync-state'
 & $app --state $state serve --share-config
 ```
@@ -72,6 +72,10 @@ bash scripts/connect-linux.sh --p2p-only --show-route
 4. Периодический режим ждёт 10 секунд после прохода и запускает следующий. `0 changes` означает, что в этом проходе применять было нечего.
 
 `P2P-only transfer via …` означает, что началась передача по прямому маршруту. Когда прямой UDP-путь недоступен, режим ждёт следующей попытки. Узлы уже могут видеть друг друга через релей на этапе установления связи.
+
+## Посмотреть файлы на Windows без синхронизации
+
+На Arch открой отдельный терминал и выполни `~/.local/bin/nice-sync --state "$HOME/.nice-sync" browse windows:/learn`. В открывшемся просмотре используй `ls`, `cd Имя папки`, `cd ..`, `pwd` и `exit`. Хост запрашивает содержимое только открытого уровня. Вложенные папки внутри `learn` можно открывать, даже если они ещё не скачаны. Для другой папки на Windows можно настроить [корень только для просмотра](language.md#просмотр-без-автоматического-обмена).
 
 ## Как изменить настройки
 
