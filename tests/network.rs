@@ -144,6 +144,43 @@ impl Fixture {
 }
 
 #[test]
+fn background_sync_survives_launcher_and_stops_between_passes() -> Result<()> {
+    let fixture = Fixture::new(SAMPLE)?;
+    let _host = fixture.listen("127.0.0.1:0", true)?;
+    fixture.join("laptop")?;
+    let args = ["start", "--every", "1", "--share", "docs"];
+    assert!(fixture.run("laptop", &args)?.contains("started"));
+    let status = || -> Result<serde_json::Value> {
+        Ok(serde_json::from_str(&fixture.run("laptop", &["status"])?)?)
+    };
+    let check = (|| -> Result<()> {
+        assert!(fixture.run("laptop", &args)?.contains("already running"));
+        fixture.write("server-files/docs/background.txt", "after launcher exit")?;
+        for _ in 0..100 {
+            let state = status()?;
+            if state["last_success_unix"].is_number()
+                && fixture.path("laptop-files/docs/background.txt").is_file()
+            {
+                assert_eq!(state["device"], "laptop");
+                assert_eq!(state["share"], "docs");
+                return fixture
+                    .assert_contents("laptop-files/docs/background.txt", "after launcher exit");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        anyhow::bail!("background sync did not transfer the file: {}", status()?)
+    })();
+    fixture.run("laptop", &["stop"])?;
+    for _ in 0..100 {
+        if status()?["phase"] == "stopped" {
+            return check;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    anyhow::bail!("background sync did not stop")
+}
+
+#[test]
 fn registered_editor_publishes_additions_moves_and_removals() -> Result<()> {
     let fixture = Fixture::new(SAMPLE)?;
     let initial = fixture.listen("127.0.0.1:0", true)?;

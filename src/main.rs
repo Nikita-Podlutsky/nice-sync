@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+mod background;
 mod terminal;
 mod update;
 
@@ -113,31 +114,42 @@ enum Command {
         version: Option<u64>,
     },
     /// Exchange files for the local device according to the applied policy.
-    Sync {
-        /// Read this local configuration before each synchronization pass.
-        #[arg(long, conflicts_with = "follow_config")]
-        config: Option<PathBuf>,
-        /// Edit this shared configuration locally and publish changes before each pass.
-        #[arg(long, conflicts_with_all = ["config", "follow_config"])]
-        publish_config: Option<PathBuf>,
-        /// Use relay for discovery only and transfer files over a direct connection.
-        #[arg(long)]
-        p2p_only: bool,
-        /// Connect directly to this IP and UDP port using the registered host key.
-        #[arg(long)]
-        direct: Option<SocketAddr>,
-        /// Print the selected Iroh path and changes to it.
-        #[arg(long)]
-        show_route: bool,
-        /// Trust and refresh the host's shared configuration before each sync.
-        #[arg(long)]
-        follow_config: bool,
-        #[arg(long)]
-        share: Option<String>,
-        /// Repeat synchronization at this interval in seconds.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-        every: Option<u64>,
-    },
+    Sync(SyncOptions),
+    /// Start periodic synchronization independently of this terminal.
+    Start(SyncOptions),
+    /// Show the current background synchronization status.
+    Status,
+    /// Request a stop after the current synchronization pass.
+    Stop,
+    #[command(hide = true)]
+    BackgroundWorker,
+}
+
+#[derive(clap::Args, serde::Serialize, serde::Deserialize)]
+struct SyncOptions {
+    /// Read this local configuration before each synchronization pass.
+    #[arg(long, conflicts_with = "follow_config")]
+    config: Option<PathBuf>,
+    /// Edit this shared configuration locally and publish changes before each pass.
+    #[arg(long, conflicts_with_all = ["config", "follow_config"])]
+    publish_config: Option<PathBuf>,
+    /// Use relay for discovery only and transfer files over a direct connection.
+    #[arg(long)]
+    p2p_only: bool,
+    /// Connect directly to this IP and UDP port using the registered host key.
+    #[arg(long)]
+    direct: Option<SocketAddr>,
+    /// Print the selected Iroh path and changes to it.
+    #[arg(long)]
+    show_route: bool,
+    /// Trust and refresh the host's shared configuration before each sync.
+    #[arg(long)]
+    follow_config: bool,
+    #[arg(long)]
+    share: Option<String>,
+    /// Repeat synchronization at this interval in seconds.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    every: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -160,13 +172,20 @@ enum Archive {
 async fn run() -> Result<()> {
     let Cli { state, command } = Cli::parse();
     let command = command.unwrap_or(Command::Menu);
+    let home = std::env::var_os("NICE_SYNC_HOME")
+        .map(PathBuf::from)
+        .or_else(std::env::home_dir);
     if matches!(command, Command::Menu) {
-        let home = std::env::var_os("NICE_SYNC_HOME")
-            .map(PathBuf::from)
-            .or_else(std::env::home_dir);
         return terminal::run(state, home);
     }
-    let state = state.unwrap_or_else(|| PathBuf::from(".nice-sync"));
+    let state = state.unwrap_or_else(|| {
+        if matches!(command, Command::Start(_) | Command::Status | Command::Stop)
+            && let Some(home) = home
+        {
+            return home.join(".nice-sync");
+        }
+        PathBuf::from(".nice-sync")
+    });
     match command {
         Command::Menu => unreachable!(),
         Command::Update => update::run()?,
@@ -371,63 +390,95 @@ async fn run() -> Result<()> {
             client.close().await;
             println!("Saved {}", destination.display());
         }
-        Command::Sync {
-            config,
-            publish_config,
-            share,
-            every,
-            follow_config,
-            direct,
-            show_route,
-            p2p_only,
-        } => {
-            let _lock = lock_directory(&state.join("runtime"))?;
-            let member = Membership::load(&state)?;
-            let mut destination = member.destination.clone();
-            if let Some(address) = direct {
-                ensure!(
-                    !address.ip().is_unspecified() && address.port() != 0,
-                    "provide a concrete host IP and nonzero UDP port"
-                );
-                destination.endpoint =
-                    iroh::EndpointAddr::new(destination.endpoint.id).with_ip_addr(address);
-                destination.direct = true;
+        Command::Sync(options) => run_sync(&state, options, None).await?,
+        Command::Start(mut options) => {
+            options.every.get_or_insert(10);
+            if options.config.is_none() && options.publish_config.is_none() {
+                options.follow_config = true;
             }
-            let config = if let Some(path) = publish_config.as_deref() {
-                SyncConfig::Editor(path)
-            } else if let Some(path) = config.as_deref() {
-                SyncConfig::Local(path)
-            } else if follow_config {
-                SyncConfig::Follow
-            } else {
-                SyncConfig::Applied
-            };
-            loop {
-                let result = async {
-                    let client = if p2p_only {
-                        Client::connect_p2p(&state, &destination).await?
-                    } else {
-                        Client::connect(&state, &destination).await?
-                    };
-                    let route = show_route.then(|| client.trace_route());
-                    let result =
-                        sync_once(&client, &state, &member, config, share.as_deref()).await;
-                    if let Some(route) = route {
-                        route.abort();
-                    }
-                    client.close().await;
-                    result
-                }
-                .await;
-                let Some(seconds) = every else { return result };
-                if let Err(error) = result {
-                    eprintln!("{error:#}");
-                }
-                tokio::time::sleep(Duration::from_secs(seconds)).await;
-            }
+            background::start(&state, &options)?;
         }
+        Command::Status => background::status(&state)?,
+        Command::Stop => background::stop(&state)?,
+        Command::BackgroundWorker => background::run(&state).await?,
     }
     Ok(())
+}
+
+async fn run_sync(
+    state: &Path,
+    options: SyncOptions,
+    worker: Option<&background::Worker>,
+) -> Result<()> {
+    let SyncOptions {
+        config,
+        publish_config,
+        share,
+        every,
+        follow_config,
+        direct,
+        show_route,
+        p2p_only,
+    } = options;
+    let _lock = lock_directory(&state.join("runtime"))?;
+    let member = Membership::load(state)?;
+    let mut destination = member.destination.clone();
+    if let Some(address) = direct {
+        ensure!(
+            !address.ip().is_unspecified() && address.port() != 0,
+            "provide a concrete host IP and nonzero UDP port"
+        );
+        destination.endpoint =
+            iroh::EndpointAddr::new(destination.endpoint.id).with_ip_addr(address);
+        destination.direct = true;
+    }
+    let config = if let Some(path) = publish_config.as_deref() {
+        SyncConfig::Editor(path)
+    } else if let Some(path) = config.as_deref() {
+        SyncConfig::Local(path)
+    } else if follow_config {
+        SyncConfig::Follow
+    } else {
+        SyncConfig::Applied
+    };
+    if let Some(worker) = worker {
+        worker.ready(&member.device, &member.destination.host, share.clone())?;
+    }
+    loop {
+        if let Some(worker) = worker {
+            if worker.stopping() {
+                return Ok(());
+            }
+            worker.pass_started()?;
+        }
+        let result = async {
+            let client = if p2p_only {
+                Client::connect_p2p(state, &destination).await?
+            } else {
+                Client::connect(state, &destination).await?
+            };
+            let route = show_route.then(|| client.trace_route());
+            let result = sync_once(&client, state, &member, config, share.as_deref()).await;
+            if let Some(route) = route {
+                route.abort();
+            }
+            client.close().await;
+            result
+        }
+        .await;
+        let Some(seconds) = every else { return result };
+        if let Err(error) = &result {
+            eprintln!("{error:#}");
+        }
+        if let Some(worker) = worker {
+            worker.pass_finished(&result)?;
+            if worker.wait(Duration::from_secs(seconds)).await {
+                return Ok(());
+            }
+        } else {
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+        }
+    }
 }
 
 async fn list_remote(client: &Client, host: &str, path: Option<&str>) -> Result<()> {

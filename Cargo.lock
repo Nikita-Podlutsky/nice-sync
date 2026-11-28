@@ -1865,6 +1865,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "iroh",
+ "libc",
  "qrcode",
  "regex",
  "serde",
