@@ -2,12 +2,13 @@
 set -euo pipefail
 
 usage() {
-    printf '%s\n' 'Usage: bash scripts/connect-linux.sh [--state DIRECTORY] [--config FILE | --publish-config FILE] [--once] [--show-route] [--p2p-only] [--direct IP:PORT]'
+    printf '%s\n' 'Usage: bash scripts/connect-linux.sh [--install-only] [--state DIRECTORY] [--config FILE | --publish-config FILE] [--once] [--show-route] [--p2p-only] [--direct IP:PORT]'
 }
 
 client_home="${NICE_SYNC_HOME:-$HOME}"
 state="$client_home/.nice-sync"
 once=false
+install_only=false
 config=
 config_option=
 route_args=()
@@ -23,6 +24,10 @@ while (($#)); do
             ;;
         --once)
             once=true
+            shift
+            ;;
+        --install-only)
+            install_only=true
             shift
             ;;
         --config|--publish-config)
@@ -69,11 +74,14 @@ fi
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 install_root="$client_home/.local"
 binary="$install_root/bin/nice-sync"
+cargo install --path "$repo_dir" --locked --force --root "$install_root"
+if [[ "$install_only" == true ]]; then
+    printf 'Open the menu with: %q --state %q\n' "$binary" "$state"
+    exit 0
+fi
+
 mkdir -p -- "$state"
 state=$(cd -- "$state" && pwd)
-
-cargo install --path "$repo_dir" --locked --force --root "$install_root"
-
 cd -- "$client_home"
 if [[ ! -f "$state/joined.json" ]]; then
     "$binary" --state "$state" join

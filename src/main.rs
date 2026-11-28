@@ -15,6 +15,9 @@ use std::{
     time::Duration,
 };
 
+mod terminal;
+mod update;
+
 #[derive(Parser)]
 #[command(
     version,
@@ -22,14 +25,18 @@ use std::{
 )]
 struct Cli {
     /// State directory for this device.
-    #[arg(long, global = true, default_value = ".nice-sync")]
-    state: PathBuf,
+    #[arg(long, global = true)]
+    state: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Open the terminal menu (also the default with no subcommand).
+    Menu,
+    /// Build and install the latest GitHub version on Linux.
+    Update,
     /// Keep and inspect local file versions.
     Archive {
         #[command(subcommand)]
@@ -152,7 +159,17 @@ enum Archive {
 
 async fn run() -> Result<()> {
     let Cli { state, command } = Cli::parse();
+    let command = command.unwrap_or(Command::Menu);
+    if matches!(command, Command::Menu) {
+        let home = std::env::var_os("NICE_SYNC_HOME")
+            .map(PathBuf::from)
+            .or_else(std::env::home_dir);
+        return terminal::run(state, home);
+    }
+    let state = state.unwrap_or_else(|| PathBuf::from(".nice-sync"));
     match command {
+        Command::Menu => unreachable!(),
+        Command::Update => update::run()?,
         Command::Archive { operation } => {
             let mut store = Store::open(&state)?;
             match operation {
