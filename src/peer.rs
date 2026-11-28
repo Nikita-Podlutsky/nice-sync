@@ -24,6 +24,7 @@ use std::{
 #[derive(Deserialize, Serialize)]
 pub enum Request {
     SharedConfig,
+    ConfigWritable,
     PublishConfig {
         expected: String,
         source: String,
@@ -119,6 +120,7 @@ pub struct WritePart {
 #[derive(Deserialize, Serialize)]
 pub enum Answer {
     SharedConfig(String),
+    ConfigWritable(bool),
     Enrolled(String),
     Code(String),
     Names(Vec<String>),
@@ -598,6 +600,7 @@ impl Server {
                 *sync_config = Some(self.config_hash);
                 (Answer::SharedConfig(self.applied.source.clone()), empty)
             }
+            Request::ConfigWritable => (Answer::ConfigWritable(can_edit), empty),
             Request::PublishConfig { expected, source } => {
                 ensure!(
                     can_edit,

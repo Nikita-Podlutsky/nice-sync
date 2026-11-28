@@ -537,21 +537,13 @@ async fn sync_once(
     share: Option<&str>,
 ) -> Result<()> {
     let local = match config {
-        SyncConfig::Follow => Applied {
-            source: shared_config(client, Request::SharedConfig).await?,
-            base: std::env::current_dir()?,
-            device: member.device.clone(),
-            file: None,
-        },
+        SyncConfig::Follow => follow_config(client, state, member).await?,
         SyncConfig::Local(path) => Applied::read(path, member.device.clone())?,
         SyncConfig::Editor(path) => edit_config(client, state, member, path).await?,
         SyncConfig::Applied => Applied::load(state)?,
     };
     let network = local.network()?;
     member.check(&network, &local.device)?;
-    if matches!(config, SyncConfig::Follow) {
-        save_host_snapshot(state, &local.source)?;
-    }
     sync::sync(client, state, &local, &network, share).await
 }
 
@@ -561,6 +553,55 @@ async fn shared_config(client: &Client, request: Request) -> Result<String> {
         Answer::SharedConfig(source) => Ok(source),
         _ => bail!("expected shared configuration"),
     }
+}
+
+async fn follow_config(client: &Client, state: &Path, member: &Membership) -> Result<Applied> {
+    let mut applied = Applied {
+        source: shared_config(client, Request::SharedConfig).await?,
+        base: std::env::current_dir()?,
+        device: member.device.clone(),
+        file: None,
+    };
+    member.check(&applied.network()?, &applied.device)?;
+    let path = state.join("shared.sync");
+    let baseline = state.join("shared-baseline.json");
+    let previous: Option<String> = read_json(&baseline)?;
+    let current = read_optional_text(&path)?;
+    if let Some(local) = &current
+        && local != &applied.source
+        && previous.as_deref() != Some(config_digest(local).as_str())
+    {
+        if previous.is_some() {
+            let (answer, _) = client.call(Request::ConfigWritable, &[]).await?;
+            if matches!(answer, Answer::ConfigWritable(true)) {
+                applied.source = publish_config(
+                    client,
+                    state,
+                    &path,
+                    previous.as_deref(),
+                    &applied.source,
+                    local,
+                )
+                .await?;
+                save_config_baseline(&baseline, &applied.source)?;
+                return Ok(applied);
+            }
+        }
+        let snapshot = state.join("host.sync");
+        if read_optional_text(&snapshot)?.as_deref() != Some(&applied.source) {
+            write_text(&snapshot, &applied.source)?;
+            eprintln!(
+                "Local edits kept in {}. Host configuration saved in {}.",
+                path.display(),
+                snapshot.display()
+            );
+        }
+        return Ok(applied);
+    } else if current.as_deref() != Some(&applied.source) {
+        replace_config(&path, &current, &applied.source)?;
+    }
+    save_config_baseline(&baseline, &applied.source)?;
+    Ok(applied)
 }
 
 async fn edit_config(
@@ -577,10 +618,15 @@ async fn edit_config(
     let base = parent.canonicalize()?;
     let path = base.join(path.file_name().context("expected a configuration file")?);
     let id = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
-    let baseline = state.join(format!("editor-{id}.json"));
+    let editor_baseline = state.join(format!("editor-{id}.json"));
+    let baseline = if path == state.canonicalize()?.join("shared.sync") {
+        state.join("shared-baseline.json")
+    } else {
+        editor_baseline.clone()
+    };
     let mut previous: Option<String> = read_json(&baseline)?;
-    if previous.is_none() && path == state.canonicalize()?.join("shared.sync") {
-        previous = read_json(&state.join("shared-baseline.json"))?;
+    if previous.is_none() && baseline != editor_baseline {
+        previous = read_json(&editor_baseline)?;
     }
     let remote = shared_config(client, Request::SharedConfig).await?;
     let current = read_optional_text(&path)?;
@@ -591,77 +637,77 @@ async fn edit_config(
         file: None,
     };
     member.check(&applied.network()?, &applied.device)?;
-    let expected = config_digest(&applied.source);
     match current.as_deref() {
         Some(local) if local == applied.source => {}
         Some(local) if previous.as_deref() != Some(config_digest(local).as_str()) => {
-            if previous.as_deref().is_some_and(|hash| hash != expected) {
-                let snapshot = state.join("host.sync");
-                write_text(&snapshot, &applied.source)?;
-                bail!(
-                    "configuration changed on both devices; merge {} into {}",
-                    snapshot.display(),
-                    path.display()
-                );
-            }
-            let published = shared_config(
+            applied.source = publish_config(
                 client,
-                Request::PublishConfig {
-                    expected,
-                    source: local.to_owned(),
-                },
+                state,
+                &path,
+                previous.as_deref(),
+                &applied.source,
+                local,
             )
             .await?;
-            applied.source = published;
-            println!("Published {}", path.display());
         }
-        _ => {
-            ensure!(
-                read_optional_text(&path)? == current,
-                "configuration changed while reading; retry sync"
-            );
-            write_text(&path, &applied.source)?;
-        }
+        _ => replace_config(&path, &current, &applied.source)?,
     }
-    let digest = config_digest(&applied.source);
-    if read_json::<Option<String>>(&baseline)?.as_ref() != Some(&digest) {
-        write_json(&baseline, &digest)?;
-    }
+    save_config_baseline(&baseline, &applied.source)?;
     Ok(applied)
+}
+
+async fn publish_config(
+    client: &Client,
+    state: &Path,
+    path: &Path,
+    previous: Option<&str>,
+    remote: &str,
+    local: &str,
+) -> Result<String> {
+    let expected = config_digest(remote);
+    if previous.is_some_and(|hash| hash != expected) {
+        let snapshot = state.join("host.sync");
+        write_text(&snapshot, remote)?;
+        bail!(
+            "configuration changed on both devices; merge {} into {}",
+            snapshot.display(),
+            path.display()
+        );
+    }
+    ensure!(
+        read_optional_text(path)?.as_deref() == Some(local),
+        "configuration changed while reading; retry sync"
+    );
+    let published = shared_config(
+        client,
+        Request::PublishConfig {
+            expected,
+            source: local.to_owned(),
+        },
+    )
+    .await?;
+    println!("Published {}", path.display());
+    Ok(published)
+}
+
+fn replace_config(path: &Path, current: &Option<String>, source: &str) -> Result<()> {
+    ensure!(
+        &read_optional_text(path)? == current,
+        "configuration changed while reading; retry sync"
+    );
+    write_text(path, source)
+}
+
+fn save_config_baseline(path: &Path, source: &str) -> Result<()> {
+    let digest = config_digest(source);
+    if read_json::<Option<String>>(path)?.as_ref() != Some(&digest) {
+        write_json(path, &digest)?;
+    }
+    Ok(())
 }
 
 fn config_digest(source: &str) -> String {
     blake3::hash(source.as_bytes()).to_hex().to_string()
-}
-
-fn save_host_snapshot(state: &Path, source: &str) -> Result<()> {
-    let shared = state.join("shared.sync");
-    let baseline = state.join("shared-baseline.json");
-    let previous: Option<String> = read_json(&baseline)?;
-    let current = read_optional_text(&shared)?;
-    let prior_matches = current
-        .as_deref()
-        .is_some_and(|text| previous.as_deref() == Some(config_digest(text).as_str()));
-    if current.as_deref().is_some_and(|text| text != source) && !prior_matches {
-        let host = state.join("host.sync");
-        if read_optional_text(&host)?.as_deref() != Some(source) {
-            save_config_text(state, &host, source)?;
-            eprintln!(
-                "Local edits kept in {}. Host configuration saved in {}.",
-                shared.display(),
-                host.display()
-            );
-        }
-        return Ok(());
-    }
-    if current.as_deref() != Some(source) {
-        save_config_text(state, &shared, source)?;
-    }
-    let digest = config_digest(source);
-    if previous.as_deref() != Some(&digest) {
-        write_json(&baseline, &digest)?;
-    }
-    Ok(())
 }
 
 fn read_optional_text(path: &Path) -> Result<Option<String>> {
@@ -670,14 +716,6 @@ fn read_optional_text(path: &Path) -> Result<Option<String>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
-}
-
-fn save_config_text(state: &Path, path: &Path, source: &str) -> Result<()> {
-    let mut snapshot = tempfile::NamedTempFile::new_in(state)?;
-    snapshot.write_all(source.as_bytes())?;
-    snapshot.as_file().sync_all()?;
-    snapshot.persist(path)?;
-    Ok(())
 }
 
 fn remote_path<'a>(host: &str, input: &'a str) -> Result<(Option<&'a str>, &'a str)> {

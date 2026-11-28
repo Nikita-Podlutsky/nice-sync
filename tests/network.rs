@@ -170,6 +170,26 @@ fn registered_editor_publishes_additions_moves_and_removals() -> Result<()> {
     )?;
     fixture.assert_contents("network.sync", SAMPLE)?;
 
+    let follow = ["sync", "--follow-config"];
+    fixture.run("laptop", &follow)?;
+    let saved_on_laptop = format!("{SAMPLE}\n# saved from shared.sync");
+    fixture.write("state-laptop/shared.sync", &saved_on_laptop)?;
+    fixture.run("laptop", &follow)?;
+    fixture.assert_contents("network.sync", &saved_on_laptop)?;
+    fixture.run("phone", &follow)?;
+    fixture.assert_contents("state-phone/shared.sync", &saved_on_laptop)?;
+    let independent = format!("{SAMPLE}\n# saved on server");
+    fixture.write("network.sync", &independent)?;
+    wait_for_config(&fixture, &mut host, &independent)?;
+    let pending = format!("{saved_on_laptop}\n# second client edit");
+    fixture.write("state-laptop/shared.sync", &pending)?;
+    fixture.failure("laptop", &follow, "changed on both devices")?;
+    fixture.assert_contents("state-laptop/shared.sync", &pending)?;
+    fixture.assert_contents("state-laptop/host.sync", &independent)?;
+    fixture.assert_contents("network.sync", &independent)?;
+    fixture.run("laptop", &editor)?;
+    fixture.assert_contents("editor.sync", &independent)?;
+
     let added = SAMPLE.replacen(
         "    share docs {",
         "    share work {\n        host server at \"server-files/Работа над собой\"\n        mirror laptop at \"laptop-files/Работа над собой\" on delete propagate on conflict keep-both\n    }\n\n    share docs {",
