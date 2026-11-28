@@ -72,6 +72,14 @@ impl Code {
 pub struct Device {
     pub name: String,
     pub grants: Grants,
+    #[serde(default)]
+    pub live_permissions: bool,
+}
+
+pub enum InvitationPolicy<'a> {
+    Template(&'a str),
+    Configured,
+    DeviceOnly,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -103,7 +111,7 @@ pub fn issue(
     network: &Network,
     destination: Destination,
     issuer: Option<EndpointId>,
-    template: Option<&str>,
+    policy: InvitationPolicy<'_>,
     device: &str,
 ) -> Result<Code> {
     ensure!(
@@ -128,8 +136,8 @@ pub fn issue(
         }
         None => &network.host,
     };
-    let (grants, lifetime) = match template {
-        Some(template) => {
+    let (grants, lifetime) = match policy {
+        InvitationPolicy::Template(template) => {
             let invitation = network
                 .invitations
                 .get(template)
@@ -140,7 +148,7 @@ pub fn issue(
             );
             (invitation.grants.clone(), invitation.expires)
         }
-        None => {
+        InvitationPolicy::Configured => {
             ensure!(
                 issuer == &network.host,
                 "only the host can issue configured permissions"
@@ -153,6 +161,17 @@ pub fn issue(
                     .clone(),
                 900,
             )
+        }
+        InvitationPolicy::DeviceOnly => {
+            ensure!(
+                issuer == &network.host,
+                "only the host can invite a device without folder permissions"
+            );
+            ensure!(
+                !network.permits.contains_key(device),
+                "remove existing permit declarations before issuing a device-only invitation"
+            );
+            (Grants::default(), 900)
         }
     };
     let now = epoch_seconds()?;
@@ -168,6 +187,7 @@ pub fn issue(
             device: Device {
                 name: device.to_owned(),
                 grants,
+                live_permissions: matches!(policy, InvitationPolicy::DeviceOnly),
             },
             expires: now + lifetime,
             used_by: None,

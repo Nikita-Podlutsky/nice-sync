@@ -444,6 +444,14 @@ impl Server {
             "device has been removed from the network"
         );
         let can_edit = self.config_editor == Some(peer);
+        if device.live_permissions {
+            device.grants = self
+                .network
+                .permits
+                .get(&device.name)
+                .cloned()
+                .unwrap_or_default();
+        }
         if can_edit {
             for (name, share) in &self.network.shares {
                 let rights = device.grants.entry(name.clone()).or_default();
@@ -629,7 +637,7 @@ impl Server {
                         &self.network,
                         self.destination.clone(),
                         Some(peer),
-                        Some(&template),
+                        access::InvitationPolicy::Template(&template),
                         &device,
                     )?
                     .encode()?,

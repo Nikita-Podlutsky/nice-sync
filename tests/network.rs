@@ -144,6 +144,33 @@ impl Fixture {
 }
 
 #[test]
+fn device_only_invitation_tracks_folder_permissions_after_join() -> Result<()> {
+    let initial = SAMPLE.replace("    device laptop", "    device laptop\n    device extra");
+    let fixture = Fixture::new(&initial)?;
+    let mut host = fixture.listen("127.0.0.1:0", true)?;
+    let code = fixture.run("server", &["invite", "--device-only", "--device", "extra"])?;
+    fixture.run("extra", &["join", code.trim()])?;
+    fixture.failure("other", &["join", code.trim()], "already used")?;
+    assert!(fixture.run("extra", &["ls"])?.trim().is_empty());
+    fixture.failure("extra", &["ls", "server:/docs"], "permission denied")?;
+
+    let with_folder = initial.replace(
+        "    share docs {",
+        "    permit extra browse, checkout on docs\n    share docs {\n        checkout extra at \"extra-docs\"",
+    );
+    fixture.write("network.sync", &with_folder)?;
+    wait_for_config(&fixture, &mut host, &with_folder)?;
+    fixture.write("server-files/docs/notes.txt", "added after registration")?;
+    fixture.run("extra", &["sync", "--follow-config"])?;
+    fixture.assert_contents("extra-docs/notes.txt", "added after registration")?;
+    fixture.write("network.sync", &initial)?;
+    wait_for_config(&fixture, &mut host, &initial)?;
+    fixture.failure("extra", &["ls", "server:/docs"], "permission denied")?;
+    fixture.assert_contents("extra-docs/notes.txt", "added after registration")?;
+    Ok(())
+}
+
+#[test]
 fn background_sync_survives_launcher_and_stops_between_passes() -> Result<()> {
     let fixture = Fixture::new(SAMPLE)?;
     let _host = fixture.listen("127.0.0.1:0", true)?;
@@ -743,7 +770,7 @@ fn expires_invitations_without_registering_a_device() -> Result<()> {
         &model,
         destination,
         None,
-        Some("docs-laptop"),
+        access::InvitationPolicy::Template("docs-laptop"),
         "laptop",
     )?;
     let now = access::epoch_seconds()?;

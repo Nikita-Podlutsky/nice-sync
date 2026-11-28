@@ -80,13 +80,16 @@ enum Command {
         device: String,
         #[arg(
             long,
-            conflicts_with = "configured",
-            required_unless_present = "configured"
+            conflicts_with_all = ["configured", "device_only"],
+            required_unless_present_any = ["configured", "device_only"]
         )]
         template: Option<String>,
         /// Use this device's permit declarations. Available on the host.
         #[arg(long)]
         configured: bool,
+        /// Register an identity first and manage folder permissions later with permit.
+        #[arg(long, conflicts_with = "configured")]
+        device_only: bool,
         /// Also display the invitation as a QR code in the terminal.
         #[arg(long)]
         qr: bool,
@@ -246,12 +249,13 @@ async fn run() -> Result<()> {
         Command::Invite {
             device,
             template,
+            device_only,
             qr,
             ..
         } => {
             let code = if state.join("joined.json").exists() {
                 let template =
-                    template.context("only the host can issue configured permissions")?;
+                    template.context("only the host can issue invitations without a template")?;
                 let member = Membership::load(&state)?;
                 let client = Client::connect(&state, &member.destination).await?;
                 let (answer, _) = client
@@ -273,7 +277,13 @@ async fn run() -> Result<()> {
                     &network,
                     destination,
                     None,
-                    template.as_deref(),
+                    if device_only {
+                        access::InvitationPolicy::DeviceOnly
+                    } else if let Some(template) = template.as_deref() {
+                        access::InvitationPolicy::Template(template)
+                    } else {
+                        access::InvitationPolicy::Configured
+                    },
                     &device,
                 )?
                 .encode()?
