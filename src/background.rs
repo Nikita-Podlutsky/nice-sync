@@ -1,9 +1,13 @@
 use crate::{SyncOptions, run_sync};
 use anyhow::{Context, Result, bail, ensure};
-use nice_sync::store::{lock_directory, read_json, write_json};
+use nice_sync::{
+    store::{lock_directory, read_json, write_json},
+    sync::FolderProgress,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     fs::{self, File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -11,14 +15,18 @@ use std::{
 };
 
 #[derive(Default, Deserialize, Serialize)]
-struct Progress {
-    device: String,
-    peer: String,
-    share: Option<String>,
-    phase: String,
-    attempts: u64,
-    last_success_unix: Option<u64>,
-    last_error: Option<String>,
+#[serde(default)]
+pub struct Progress {
+    pub device: String,
+    pub peer: String,
+    pub share: Option<String>,
+    pub phase: String,
+    pub attempts: u64,
+    pub last_success_unix: Option<u64>,
+    pub last_error: Option<String>,
+    pub folders: BTreeMap<String, FolderProgress>,
+    pub retry_unix: Option<u64>,
+    pub config_hash: Option<String>,
 }
 
 pub struct Worker {
@@ -41,21 +49,39 @@ impl Worker {
     pub fn pass_started(&self) -> Result<()> {
         let mut progress = self.progress.borrow_mut();
         progress.phase = "syncing".into();
+        progress.retry_unix = None;
+        progress.folders.clear();
         progress.attempts += 1;
         drop(progress);
         self.save()
     }
 
-    pub fn pass_finished(&self, result: &Result<()>) -> Result<()> {
+    pub fn pass_finished(&self, result: &Result<()>, interval: u64) -> Result<()> {
         let mut progress = self.progress.borrow_mut();
         progress.phase = "waiting".into();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        progress.retry_unix = Some(now.saturating_add(interval));
         progress.last_error = result.as_ref().err().map(|error| format!("{error:#}"));
         if result.is_ok() {
-            progress.last_success_unix =
-                Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+            progress.last_success_unix = Some(now);
         }
         drop(progress);
         self.save()
+    }
+
+    pub fn config_applied(&self, source: &str) -> Result<()> {
+        self.progress.borrow_mut().config_hash = Some(crate::config_digest(source));
+        self.save()
+    }
+
+    pub fn folder(&self, folder: &str, status: &FolderProgress) {
+        self.progress
+            .borrow_mut()
+            .folders
+            .insert(folder.into(), status.clone());
+        if let Err(error) = self.save() {
+            eprintln!("could not save sync progress: {error:#}");
+        }
     }
 
     fn save(&self) -> Result<()> {
@@ -224,7 +250,7 @@ fn detach(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-pub fn status(state: &Path) -> Result<()> {
+pub fn snapshot(state: &Path) -> Result<Progress> {
     let directory = state.join("background");
     let active = running(&directory)?;
     let mut progress: Progress = read_json(&directory.join("status.json"))?;
@@ -235,7 +261,11 @@ pub fn status(state: &Path) -> Result<()> {
     } else if progress.phase.is_empty() {
         progress.phase = "starting".into();
     }
-    println!("{}", serde_json::to_string_pretty(&progress)?);
+    Ok(progress)
+}
+
+pub fn status(state: &Path) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(&snapshot(state)?)?);
     Ok(())
 }
 

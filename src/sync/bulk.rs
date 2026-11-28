@@ -1,4 +1,4 @@
-use super::{Job, Tracked, Tracking};
+use super::{FolderProgress, Job, Tracked, Tracking};
 use crate::{
     language::Mode,
     peer::{Answer, ReadPart, Request, WritePart},
@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
+    time::Instant,
 };
 
 impl Job<'_> {
@@ -21,6 +22,7 @@ impl Job<'_> {
         mut tracking: Tracking,
         mut heads: Heads,
         ignored: &impl Fn(&str, bool) -> bool,
+        status: &mut FolderProgress,
     ) -> Result<usize> {
         let pending = self.directory.join("pending.json");
         let saved = self.directory.join("tracking.json");
@@ -64,8 +66,25 @@ impl Job<'_> {
                 }
             }
         }
-        for batch in changes.chunks(PACK_ENTRIES) {
-            self.send_pack(batch, &files).await?;
+        let mut meter = Meter::new(
+            "upload",
+            status,
+            changes
+                .iter()
+                .filter_map(|c| c.blob.as_ref())
+                .map(|b| b.size)
+                .sum(),
+            changes.len(),
+            0,
+        );
+        for (index, batch) in changes.chunks(PACK_ENTRIES).enumerate() {
+            meter.status.upcoming = changes[index * PACK_ENTRIES..]
+                .iter()
+                .take(5)
+                .map(|change| change.path.clone())
+                .collect();
+            self.report(meter.status);
+            self.send_pack(batch, &files, &mut meter).await?;
             if !self.mode.downloads() {
                 for change in batch {
                     tracking.insert(
@@ -97,12 +116,17 @@ impl Job<'_> {
             };
             heads = current;
         }
-        self.receive_packs(heads, &before, &mut tracking, ignored)
+        self.receive_packs(heads, &before, &mut tracking, ignored, status)
             .await
             .map(|count| count + changes.len())
     }
 
-    async fn send_pack(&self, changes: &[Change], files: &BTreeMap<String, PathBuf>) -> Result<()> {
+    async fn send_pack(
+        &self,
+        changes: &[Change],
+        files: &BTreeMap<String, PathBuf>,
+        meter: &mut Meter<'_>,
+    ) -> Result<()> {
         let (Answer::BulkOffsets(offsets), _) = self
             .client
             .call(
@@ -123,6 +147,12 @@ impl Job<'_> {
         let mut parts = Vec::new();
         let mut bytes = Vec::new();
         let mut sent = BTreeSet::new();
+        let previous = meter.status.completed_bytes;
+        let batch_bytes: u64 = changes
+            .iter()
+            .filter_map(|c| c.blob.as_ref())
+            .map(|b| b.size)
+            .sum();
         for (change, mut offset) in changes.iter().zip(offsets) {
             let Some(blob) = &change.blob else { continue };
             if !sent.insert(&blob.hash) {
@@ -140,13 +170,14 @@ impl Job<'_> {
                 });
                 offset += length as u64;
                 if bytes.len() == PACK_BYTES || parts.len() == PACK_ENTRIES {
-                    self.send_bytes(std::mem::take(&mut parts), &bytes).await?;
+                    self.send_bytes(std::mem::take(&mut parts), &bytes, meter)
+                        .await?;
                     bytes.clear();
                 }
             }
         }
         if !parts.is_empty() {
-            self.send_bytes(parts, &bytes).await?;
+            self.send_bytes(parts, &bytes, meter).await?;
         }
         let (Answer::BulkCommitted(paths), _) = self
             .client
@@ -165,18 +196,31 @@ impl Job<'_> {
             paths.len() == changes.len(),
             "unexpected upload confirmation count"
         );
+        meter.status.completed_bytes = previous + batch_bytes;
+        meter.status.completed_files += changes.len();
         for (change, path) in changes.iter().zip(paths) {
             if path != change.path {
+                meter.status.conflicts += 1;
                 eprintln!(
                     "Conflict in {}: preserved incoming bytes as {path}",
                     change.path
                 );
             }
         }
+        if meter.status.completed_files == meter.status.total_files {
+            meter.status.upcoming.clear();
+        }
+        meter.update(self, 0, None);
         Ok(())
     }
 
-    async fn send_bytes(&self, parts: Vec<WritePart>, bytes: &[u8]) -> Result<()> {
+    async fn send_bytes(
+        &self,
+        parts: Vec<WritePart>,
+        bytes: &[u8],
+        meter: &mut Meter<'_>,
+    ) -> Result<()> {
+        let path = parts.last().map(|part| part.path.clone());
         let (answer, _) = self
             .client
             .call(
@@ -191,6 +235,7 @@ impl Job<'_> {
             matches!(answer, Answer::BulkData),
             "expected upload packet confirmation"
         );
+        meter.update(self, bytes.len() as u64, path);
         eprintln!(
             "{}: sent {:.2} MiB",
             self.share,
@@ -205,6 +250,7 @@ impl Job<'_> {
         before: &BTreeMap<String, Blob>,
         tracking: &mut Tracking,
         ignored: &impl Fn(&str, bool) -> bool,
+        status: &mut FolderProgress,
     ) -> Result<usize> {
         let mut records = Tracking::new();
         let mut removals = Vec::new();
@@ -270,6 +316,20 @@ impl Job<'_> {
         })?;
 
         let mut downloads = downloads.into_values().collect::<Vec<_>>();
+        let mut meter = Meter::new(
+            "download",
+            status,
+            downloads.iter().map(|file| file.blob.size).sum(),
+            downloads.iter().map(|file| file.paths.len()).sum(),
+            downloads.iter().map(|file| file.offset).sum(),
+        );
+        meter.status.upcoming = downloads
+            .iter()
+            .flat_map(|file| &file.paths)
+            .take(5)
+            .map(|(path, _)| path.clone())
+            .collect();
+        self.report(meter.status);
         let mut cursor = 0;
         while cursor < downloads.len() {
             let mut packet = Vec::new();
@@ -300,6 +360,7 @@ impl Job<'_> {
                 cursor += 1;
             }
             if !packet.is_empty() {
+                let path = packet.last().map(|part| part.path.clone());
                 let (answer, data) = self
                     .client
                     .call(
@@ -326,6 +387,7 @@ impl Job<'_> {
                     }
                     position += length;
                 }
+                meter.update(self, data.len() as u64, path);
                 eprintln!(
                     "{}: received {:.2} MiB",
                     self.share,
@@ -348,7 +410,8 @@ impl Job<'_> {
                     }
                 }
             }
-            count += records.len();
+            let installed = records.len();
+            count += installed;
             self.checkpoint(tracking, records.clone(), || {
                 for file in &downloads[start..cursor] {
                     let source = if file.bytes.is_none() {
@@ -373,10 +436,21 @@ impl Job<'_> {
                 }
                 Ok(())
             })?;
+            if installed > 0 {
+                meter.status.completed_files += installed;
+                meter.status.upcoming = downloads[cursor..]
+                    .iter()
+                    .flat_map(|file| &file.paths)
+                    .take(5)
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                meter.update(self, 0, None);
+            }
             for file in &mut downloads[start..cursor] {
                 file.bytes = None;
             }
         }
+        meter.status.conflicts += skipped.len();
         ensure!(
             skipped.is_empty(),
             "local files changed or need to be moved aside: {}",
@@ -410,6 +484,56 @@ struct Download {
     blob: Blob,
     paths: Vec<(String, u64)>,
     bytes: Option<Vec<u8>>,
+}
+
+struct Meter<'a> {
+    status: &'a mut FolderProgress,
+    started: Instant,
+    transferred: u64,
+}
+
+impl<'a> Meter<'a> {
+    fn new(
+        direction: &str,
+        status: &'a mut FolderProgress,
+        total: u64,
+        files: usize,
+        resumed: u64,
+    ) -> Self {
+        status.phase = "transferring".into();
+        status.direction = Some(direction.into());
+        status.path = None;
+        status.upcoming.clear();
+        status.total_bytes = Some(total);
+        status.completed_bytes = resumed;
+        status.total_files = files;
+        status.completed_files = 0;
+        status.bytes_per_second = 0;
+        status.eta_seconds = None;
+        Self {
+            status,
+            started: Instant::now(),
+            transferred: 0,
+        }
+    }
+
+    fn update(&mut self, job: &Job<'_>, bytes: u64, path: Option<String>) {
+        self.transferred += bytes;
+        self.status.completed_bytes += bytes;
+        if path.is_some() {
+            self.status.path = path;
+        }
+        self.status.bytes_per_second =
+            (self.transferred as f64 / self.started.elapsed().as_secs_f64().max(0.001)) as u64;
+        let remaining = self
+            .status
+            .total_bytes
+            .unwrap_or_default()
+            .saturating_sub(self.status.completed_bytes);
+        self.status.eta_seconds = (self.status.bytes_per_second > 0)
+            .then(|| remaining.div_ceil(self.status.bytes_per_second));
+        job.report(self.status);
+    }
 }
 
 fn clone_changes(changes: &[Change]) -> Vec<Change> {

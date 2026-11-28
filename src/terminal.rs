@@ -1,9 +1,11 @@
+mod workspace;
+
 use anyhow::{Context, Result, bail, ensure};
 use crossterm::{
     cursor::MoveTo,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, queue,
-    style::{Attribute, Print, SetAttribute},
+    style::{Attribute, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use nice_sync::{
@@ -53,6 +55,7 @@ struct Settings {
     listen: Option<SocketAddr>,
     share_config: bool,
     editor: Option<String>,
+    reduce_motion: bool,
 }
 
 impl Default for Settings {
@@ -67,13 +70,14 @@ impl Default for Settings {
             listen: None,
             share_config: true,
             editor: None,
+            reduce_motion: false,
         }
     }
 }
 
 impl Settings {
     fn sync(&self, command: &mut Command, repeat: bool) {
-        command.arg("sync");
+        command.arg(if repeat { "start" } else { "sync" });
         match &self.config {
             Config::Shared => {
                 command.arg("--follow-config");
@@ -83,6 +87,9 @@ impl Settings {
             }
             Config::Publish(path) => {
                 command.arg("--publish-config").arg(path);
+            }
+            Config::Applied if repeat => {
+                command.arg("--applied");
             }
             Config::Applied => {}
         }
@@ -194,7 +201,7 @@ pub fn run(state: Option<PathBuf>, home: Option<PathBuf>) -> Result<()> {
             settings.config.label()
         );
         let choices = [
-            "Запустить синхронизацию",
+            "Запустить фоновый обмен",
             "Синхронизировать один раз",
             "Запустить публикацию папок",
             "Остановить процесс",
@@ -206,7 +213,14 @@ pub fn run(state: Option<PathBuf>, home: Option<PathBuf>) -> Result<()> {
             "Обновить из GitHub",
             "Выход",
         ];
-        let Some(action) = choose(&header, &choices, &mut cursor)? else {
+        let Some(action) = workspace::menu(
+            &header,
+            &choices,
+            &mut cursor,
+            &state,
+            settings.reduce_motion,
+        )?
+        else {
             return session.stop();
         };
         if action == 10 {
@@ -215,26 +229,29 @@ pub fn run(state: Option<PathBuf>, home: Option<PathBuf>) -> Result<()> {
         let result = (|| -> Result<()> {
             let mut process = command();
             match action {
-                0 | 1 => {
-                    settings.sync(&mut process, action == 0);
+                0 => {
+                    settings.sync(&mut process, true);
+                    run_child(&mut process, "запуск фонового обмена")?;
+                }
+                1 => {
+                    settings.sync(&mut process, false);
                     session.start(&mut process, &log)?;
                 }
                 2 => {
                     settings.serve(&mut process);
                     session.start(&mut process, &log)?;
                 }
-                3 => session.stop()?,
+                3 => {
+                    if session.0.is_some() {
+                        session.stop()?;
+                    } else {
+                        crate::background::stop(&state)?;
+                    }
+                }
                 4 => edit_settings(&mut settings, &settings_file, &work)?,
                 5 => {
                     let file = config_file(&settings.config, &state, &work)?;
-                    let editor = env::var_os("VISUAL")
-                        .or_else(|| env::var_os("EDITOR"))
-                        .unwrap_or_else(|| if cfg!(windows) { "notepad" } else { "nano" }.into());
-                    run_child(Command::new(editor).arg(&file), "редактор")?;
-                    if file.is_file() {
-                        run_child(process.arg("check").arg(&file), "проверка")?;
-                        pause()?;
-                    }
+                    workspace::edit(&file, &state, settings.reduce_motion)?;
                 }
                 6 => {
                     let file = config_file(&settings.config, &state, &work)?;
@@ -259,8 +276,14 @@ pub fn run(state: Option<PathBuf>, home: Option<PathBuf>) -> Result<()> {
                     pause()?;
                 }
                 8 => {
+                    let background_log = state.join("background/sync.log");
+                    let selected = if session.0.is_some() || !background_log.is_file() {
+                        &log
+                    } else {
+                        &background_log
+                    };
                     let mut file =
-                        File::open(&log).context("журнал появится после запуска обмена")?;
+                        File::open(selected).context("журнал появится после запуска обмена")?;
                     file.seek(SeekFrom::Start(file.metadata()?.len().saturating_sub(8192)))?;
                     let mut bytes = Vec::new();
                     file.take(8192).read_to_end(&mut bytes)?;
@@ -342,6 +365,7 @@ fn edit_settings(saved: &mut Settings, file: &Path, work: &Path) -> Result<()> {
                 "Редактор общего конфига  {}",
                 settings.editor.as_deref().unwrap_or("—")
             ),
+            format!("Меньше анимации  {}", toggle(settings.reduce_motion)),
             "Назад".into(),
         ];
         let items = rows.each_ref().map(String::as_str);
@@ -408,6 +432,7 @@ fn edit_settings(saved: &mut Settings, file: &Path, work: &Path) -> Result<()> {
                 Some(8) => {
                     settings.editor = optional(prompt("Имя устройства, пусто для отключения")?)
                 }
+                Some(9) => settings.reduce_motion = !settings.reduce_motion,
                 _ => return Ok(false),
             }
             write_json(file, &settings)?;
@@ -448,6 +473,7 @@ impl Drop for Screen {
         let _ = terminal::disable_raw_mode();
         let _ = execute!(
             io::stdout(),
+            ResetColor,
             SetAttribute(Attribute::Reset),
             LeaveAlternateScreen
         );
@@ -467,7 +493,12 @@ fn choose(header: &str, rows: &[&str], selected: &mut usize) -> Result<Option<us
         let start = heading.len() + 1;
         let visible = height.saturating_sub(start + 1).max(1);
         let first = selected.saturating_sub(visible - 1);
-        queue!(out, Clear(ClearType::All))?;
+        queue!(
+            out,
+            SetBackgroundColor(workspace::DARK),
+            SetForegroundColor(workspace::TEXT),
+            Clear(ClearType::All)
+        )?;
         for (line, text) in heading.iter().enumerate().take(height) {
             queue!(
                 out,

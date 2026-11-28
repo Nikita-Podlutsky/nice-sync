@@ -187,9 +187,17 @@ fn background_sync_survives_launcher_and_stops_between_passes() -> Result<()> {
             let state = status()?;
             if state["last_success_unix"].is_number()
                 && fixture.path("laptop-files/docs/background.txt").is_file()
+                && state["folders"]["docs"]["phase"] == "complete"
+                && state["folders"]["docs"]["completed_files"] == 1
             {
                 assert_eq!(state["device"], "laptop");
                 assert_eq!(state["share"], "docs");
+                let folder = &state["folders"]["docs"];
+                assert_eq!(folder["direction"], "download");
+                assert_eq!(folder["path"], "background.txt");
+                assert_eq!(folder["total_files"], 1);
+                assert_eq!(folder["total_bytes"], "after launcher exit".len());
+                assert_eq!(folder["completed_bytes"], folder["total_bytes"]);
                 return fixture
                     .assert_contents("laptop-files/docs/background.txt", "after launcher exit");
             }

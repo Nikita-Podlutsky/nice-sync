@@ -119,7 +119,13 @@ enum Command {
     /// Exchange files for the local device according to the applied policy.
     Sync(SyncOptions),
     /// Start periodic synchronization independently of this terminal.
-    Start(SyncOptions),
+    Start {
+        #[command(flatten)]
+        options: SyncOptions,
+        /// Read the configuration snapshot saved by apply.
+        #[arg(long, conflicts_with_all = ["config", "publish_config", "follow_config"])]
+        applied: bool,
+    },
     /// Show the current background synchronization status.
     Status,
     /// Request a stop after the current synchronization pass.
@@ -182,8 +188,10 @@ async fn run() -> Result<()> {
         return terminal::run(state, home);
     }
     let state = state.unwrap_or_else(|| {
-        if matches!(command, Command::Start(_) | Command::Status | Command::Stop)
-            && let Some(home) = home
+        if matches!(
+            command,
+            Command::Start { .. } | Command::Status | Command::Stop
+        ) && let Some(home) = home
         {
             return home.join(".nice-sync");
         }
@@ -348,7 +356,7 @@ async fn run() -> Result<()> {
                 member.destination.network, member.device, member.destination.host
             );
             if sync {
-                sync_once(&client, &state, &member, SyncConfig::Follow, None).await?;
+                sync_once(&client, &state, &member, SyncConfig::Follow, None, None).await?;
             }
             client.close().await;
         }
@@ -401,9 +409,12 @@ async fn run() -> Result<()> {
             println!("Saved {}", destination.display());
         }
         Command::Sync(options) => run_sync(&state, options, None).await?,
-        Command::Start(mut options) => {
+        Command::Start {
+            mut options,
+            applied,
+        } => {
             options.every.get_or_insert(10);
-            if options.config.is_none() && options.publish_config.is_none() {
+            if !applied && options.config.is_none() && options.publish_config.is_none() {
                 options.follow_config = true;
             }
             background::start(&state, &options)?;
@@ -468,7 +479,7 @@ async fn run_sync(
                 Client::connect(state, &destination).await?
             };
             let route = show_route.then(|| client.trace_route());
-            let result = sync_once(&client, state, &member, config, share.as_deref()).await;
+            let result = sync_once(&client, state, &member, config, share.as_deref(), worker).await;
             if let Some(route) = route {
                 route.abort();
             }
@@ -481,7 +492,7 @@ async fn run_sync(
             eprintln!("{error:#}");
         }
         if let Some(worker) = worker {
-            worker.pass_finished(&result)?;
+            worker.pass_finished(&result, seconds)?;
             if worker.wait(Duration::from_secs(seconds)).await {
                 return Ok(());
             }
@@ -613,6 +624,7 @@ async fn sync_once(
     member: &Membership,
     config: SyncConfig<'_>,
     share: Option<&str>,
+    worker: Option<&background::Worker>,
 ) -> Result<()> {
     let local = match config {
         SyncConfig::Follow => follow_config(client, state, member).await?,
@@ -622,7 +634,23 @@ async fn sync_once(
     };
     let network = local.network()?;
     member.check(&network, &local.device)?;
-    sync::sync(client, state, &local, &network, share).await
+    let report = |folder: &str, progress: &sync::FolderProgress| {
+        if let Some(worker) = worker {
+            worker.folder(folder, progress);
+        }
+    };
+    if let Some(worker) = worker {
+        worker.config_applied(&local.source)?;
+    }
+    sync::sync(
+        client,
+        state,
+        &local,
+        &network,
+        share,
+        worker.map(|_| &report as sync::ProgressSink<'_>),
+    )
+    .await
 }
 
 async fn shared_config(client: &Client, request: Request) -> Result<String> {

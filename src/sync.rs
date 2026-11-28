@@ -27,12 +27,33 @@ struct Tracked {
 
 type Tracking = BTreeMap<String, Tracked>;
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct FolderProgress {
+    pub phase: String,
+    pub direction: Option<String>,
+    pub path: Option<String>,
+    pub total_bytes: Option<u64>,
+    pub completed_bytes: u64,
+    pub total_files: usize,
+    pub completed_files: usize,
+    pub indexed_files: usize,
+    pub bytes_per_second: u64,
+    pub eta_seconds: Option<u64>,
+    pub error: Option<String>,
+    pub upcoming: Vec<String>,
+    pub conflicts: usize,
+}
+
+pub type ProgressSink<'a> = &'a dyn Fn(&str, &FolderProgress);
+
 pub async fn sync(
     client: &Client,
     state: &Path,
     applied: &Applied,
     network: &Network,
     only: Option<&str>,
+    progress: Option<ProgressSink<'_>>,
 ) -> Result<()> {
     let mut shares: Vec<(&String, &Share, PathBuf, PathBuf)> = Vec::new();
     for (name, share) in &network.shares {
@@ -99,6 +120,7 @@ pub async fn sync(
             root,
             mode: rule.mode,
             propagate: rule.propagate_delete,
+            progress,
         };
         if reset.try_exists()? {
             fs::create_dir_all(&job.directory)?;
@@ -110,10 +132,25 @@ pub async fn sync(
             }
             fs::remove_file(reset)?;
         }
-        match job.run(ignored).await {
-            Ok(count) => println!("{name}: {count} changes"),
-            Err(error) => failures.push(format!("{name}: {error:#}")),
+        let mut status = FolderProgress {
+            phase: "indexing".into(),
+            ..FolderProgress::default()
+        };
+        job.report(&status);
+        match job.run(ignored, &mut status).await {
+            Ok(count) => {
+                status.phase = "complete".into();
+                println!("{name}: {count} changes");
+            }
+            Err(error) => {
+                status.phase = "error".into();
+                status.error = Some(format!("{error:#}"));
+                failures.push(format!("{name}: {error:#}"));
+            }
         }
+        status.bytes_per_second = 0;
+        status.eta_seconds = None;
+        job.report(&status);
     }
     ensure!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
@@ -126,10 +163,21 @@ struct Job<'a> {
     root: PathBuf,
     mode: Mode,
     propagate: bool,
+    progress: Option<ProgressSink<'a>>,
 }
 
 impl Job<'_> {
-    async fn run(&self, ignored: impl Fn(&str, bool) -> bool) -> Result<usize> {
+    fn report(&self, progress: &FolderProgress) {
+        if let Some(sink) = self.progress {
+            sink(self.share, progress);
+        }
+    }
+
+    async fn run(
+        &self,
+        ignored: impl Fn(&str, bool) -> bool,
+        status: &mut FolderProgress,
+    ) -> Result<usize> {
         fs::create_dir_all(&self.directory)?;
         let tracking_file = self.directory.join("tracking.json");
         let mut tracking: Tracking = read_json(&tracking_file)?;
@@ -141,6 +189,9 @@ impl Job<'_> {
             .iter()
             .map(|(path, file)| Ok((path.clone(), fingerprint(&mut File::open(file)?)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        status.indexed_files = before.len();
+        status.phase = "comparing".into();
+        self.report(status);
         match self
             .client
             .call(
@@ -153,7 +204,7 @@ impl Job<'_> {
         {
             Ok((Answer::Manifest(heads), _)) => {
                 return self
-                    .run_bulk(files, before, tracking, heads, &ignored)
+                    .run_bulk(files, before, tracking, heads, &ignored, status)
                     .await;
             }
             Ok(_) => bail!("expected synchronization index"),
@@ -162,6 +213,8 @@ impl Job<'_> {
             }
             Err(error) => return Err(error),
         }
+        status.phase = "legacy_transfer".into();
+        self.report(status);
         let mut count = 0;
         if self.propagate {
             for (path, entry) in &tracking {
